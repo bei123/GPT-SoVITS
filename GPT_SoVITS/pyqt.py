@@ -91,6 +91,8 @@ class TextToSpeechApp(QWidget):
     
     def __init__(self):
         super().__init__()
+        self.serverUrlEdit = QLineEdit("http://127.0.0.1")
+        self.serverPortEdit = QLineEdit("9880")
         self.topKEdit = QLineEdit("20")
         self.topPEdit = QLineEdit("0.6")
         self.temperatureEdit = QLineEdit("0.6")
@@ -101,24 +103,33 @@ class TextToSpeechApp(QWidget):
         self.get_and_display_files()  # 调用该方法以填充文件列表
         self.getSovitsModelFiles()
         self.getGPTModelFiles()  # 在初始化时获取 Sovits 模型文件列表
+        
+        self.formLayout.addRow(QLabel('服务器地址：'), self.serverUrlEdit)
+        self.formLayout.addRow(QLabel('服务器端口：'), self.serverPortEdit)
 
     
 
     def uploadFileToServervideo(self):
-        filePath, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "All Files (*)")
-        if filePath:  # 确保用户选择了文件
-            try:
+        # 从输入字段获取服务器地址和端口
+        server_url = self.serverUrlEdit.text().strip()
+        server_port = self.serverPortEdit.text().strip()
+        full_url = f"{server_url}:{server_port}/upload_video"
+        
+        # 使用这些设置发送网络请求
+        try:
+            filePath, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "All Files (*)")
+            if filePath:  # 确保用户选择了文件
                 files = {'file': open(filePath, 'rb')}
-                response = requests.post("http://127.0.0.1:9880/upload_video", files=files)
+                response = requests.post(full_url, files=files)
                 if response.status_code == 200:
                     self.showMessageBox('成功', f'文件上传成功: {response.json()["message"]}')
                 else:
                     self.showMessageBox('错误', f'文件上传失败: {response.json()["message"]}')
-            except Exception as e:
-                self.showMessageBox('错误', f'上传过程中发生异常: {str(e)}')
-            finally:
-                if 'files' in locals():
-                    files['file'].close()
+        except Exception as e:
+            self.showMessageBox('错误', f'上传过程中发生异常: {str(e)}')
+        finally:
+            if 'files' in locals():
+                files['file'].close()
 
                     
     
@@ -246,8 +257,13 @@ class TextToSpeechApp(QWidget):
         self.formLayout.addRow(QLabel('Sovits模型文件：'), self.sovitsModelComboBox)
 
     def getGPTModelFiles(self):
+    # 从输入字段获取服务器地址和端口
+        server_url = self.serverUrlEdit.text().strip()
+        server_port = self.serverPortEdit.text().strip()
+        full_url = f"{server_url}:{server_port}/GPT_list_files"
+
         try:
-            response = requests.get("http://127.0.0.1:9880/GPT_list_files")
+            response = requests.get(full_url)
             if response.status_code == 200:
                 files = response.json()
                 self.gptModelComboBox.clear()
@@ -258,8 +274,13 @@ class TextToSpeechApp(QWidget):
             QMessageBox.critical(self, '错误', f'请求发送异常: {str(e)}')
 
     def getSovitsModelFiles(self):
+    # 从输入字段获取服务器地址和端口
+        server_url = self.serverUrlEdit.text().strip()
+        server_port = self.serverPortEdit.text().strip()
+        full_url = f"{server_url}:{server_port}/SOVITS_list_files"
+
         try:
-            response = requests.get("http://127.0.0.1:9880/SOVITS_list_files")
+            response = requests.get(full_url)
             if response.status_code == 200:
                 files = response.json()
                 self.sovitsModelComboBox.clear()
@@ -268,6 +289,7 @@ class TextToSpeechApp(QWidget):
                 QMessageBox.critical(self, '失败', f'无法获取 Sovits 模型文件列表: {response.text}')
         except Exception as e:
             QMessageBox.critical(self, '错误', f'请求发送异常: {str(e)}')
+
 
     def updateModelPaths(self):
         if self.isUpdatingModel:
@@ -279,8 +301,13 @@ class TextToSpeechApp(QWidget):
             "gpt_model_path": gpt_path,
             "sovits_model_path": sovits_path
         }
+        # 从输入字段获取服务器地址和端口
+        server_url = self.serverUrlEdit.text().strip()
+        server_port = self.serverPortEdit.text().strip()
+        full_url = f"{server_url}:{server_port}/set_model"
+
         try:
-            response = requests.post("http://127.0.0.1:9880/set_model", json=data)
+            response = requests.post(full_url, json=data)
             if response.status_code == 200:
                 QMessageBox.information(self, '成功', '模型路径更新成功')
             else:
@@ -291,19 +318,26 @@ class TextToSpeechApp(QWidget):
             self.isUpdatingModel = False  # 无论成功还是失败最后都应该重置标志
 
 
+
     def get_and_display_files(self):
         self.referAudioComboBox.clear()  # 清除现有条目
+        # 从输入字段获取服务器地址和端口
+        server_url = self.serverUrlEdit.text().strip()
+        server_port = self.serverPortEdit.text().strip()
+        full_url = f"{server_url}:{server_port}/video_list_files"
+
         try:
-            response = requests.get('http://127.0.0.1:9880/video_list_files')
+            response = requests.get(full_url)
             if response.status_code == 200:
                 files = response.json()
                 for file_path in files:
-                    file_name = file_path.split('/')[-1]  
-                    self.referAudioComboBox.addItem(file_name, file_path)  
+                    file_name = file_path.split('/')[-1]
+                    self.referAudioComboBox.addItem(file_name, file_path)
             else:
                 QMessageBox.critical(self, '错误', '无法从服务器获取文件列表。')
         except Exception as e:
             QMessageBox.critical(self, '错误', f'获取文件列表时发生错误: {e}')
+
 
 
     def updateReferAudioPath(self):
@@ -389,14 +423,23 @@ class TextToSpeechApp(QWidget):
         return cut_methods[method](text)
 
     def postTextToTtsApi(self, data, output_file_path):
-        url = "http://127.0.0.1:9880/"  
-        response = requests.post(url, json=data)
-        if response.status_code == 200:
-            with open(output_file_path, "wb") as f:
-                f.write(response.content)
-            QMessageBox.information(self, '成功', f'音频已成功保存至 {output_file_path}')
-        else:
-            QMessageBox.critical(self, '错误', f'请求失败，状态码：{response.status_code}')
+    # 从输入字段获取服务器地址和端口
+        server_url = self.serverUrlEdit.text().strip()
+        server_port = self.serverPortEdit.text().strip()
+    # 构建完整的URL
+        full_url = f"{server_url}:{server_port}/"  # 如果API有具体的路径，需要将"/"替换成"/api_path"
+
+        try:
+            response = requests.post(full_url, json=data)
+            if response.status_code == 200:
+                with open(output_file_path, "wb") as f:
+                    f.write(response.content)
+                QMessageBox.information(self, '成功', f'音频已成功保存至 {output_file_path}')
+            else:
+                QMessageBox.critical(self, '错误', f'请求失败，状态码：{response.status_code}')
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'请求发送异常: {str(e)}')
+
     def createLineItem(self, label, buttonText, fileType, save=False):
         
         lineEdit = QLineEdit()
