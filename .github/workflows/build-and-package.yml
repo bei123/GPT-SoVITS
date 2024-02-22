@@ -72,5 +72,5 @@ jobs:
     - name: Upload MacOS artifact
       uses: actions/upload-artifact@v2
       with:
-        name: pyqt-macos
+        name: pyqt-macos.exe
         path: dist/
