@@ -105,7 +105,7 @@ RESP: 无
 import argparse
 import os
 import sys
-
+import LangSegment
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 sys.path.append("%s/GPT_SoVITS" % (now_dir))
@@ -129,6 +129,10 @@ from text.cleaner import clean_text
 from module.mel_processing import spectrogram_torch
 from my_utils import load_audio
 import config as global_config
+import re
+from fastapi import File, UploadFile
+import shutil
+from flask import Flask, jsonify
 
 g_config = global_config.Config()
 
@@ -340,62 +344,326 @@ def get_spepc(hps, filename):
                              hps.data.win_length, center=False)
     return spec
 
-
 dict_language = {
-    "中文": "zh",
-    "英文": "en",
-    "日文": "ja",
-    "ZH": "zh",
-    "EN": "en",
-    "JA": "ja",
-    "zh": "zh",
-    "en": "en",
-    "ja": "ja"
+    ("中文"): "all_zh",#全部按中文识别
+    ("英文"): "en",#全部按英文识别#######不变
+    ("日文"): "all_ja",#全部按日文识别
+    ("中英混合"): "zh",#按中英混合识别####不变
+    ("日英混合"): "ja",#按日英混合识别####不变
+    ("多语种混合"): "auto",#多语种启动切分识别语种
 }
 
 
-def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language):
+
+splits = {"，", "。", "？", "！", ",", ".", "?", "!", "~", ":", "：", "—", "…", }
+
+def get_phones_and_bert(text,language):
+    if language in {"en","all_zh","all_ja"}:
+        language = language.replace("all_","")
+        if language == "en":
+            LangSegment.setfilters(["en"])
+            formattext = " ".join(tmp["text"] for tmp in LangSegment.getTexts(text))
+        else:
+            # 因无法区别中日文汉字,以用户输入为准
+            formattext = text
+        while "  " in formattext:
+            formattext = formattext.replace("  ", " ")
+        phones, word2ph, norm_text = clean_text_inf(formattext, language)
+        if language == "zh":
+            bert = get_bert_feature(norm_text, word2ph).to(device)
+        else:
+            bert = torch.zeros(
+                (1024, len(phones)),
+                dtype=torch.float16 if is_half == True else torch.float32,
+            ).to(device)
+    elif language in {"zh", "ja","auto"}:
+        textlist=[]
+        langlist=[]
+        LangSegment.setfilters(["zh","ja","en"])
+        if language == "auto":
+            for tmp in LangSegment.getTexts(text):
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        else:
+            for tmp in LangSegment.getTexts(text):
+                if tmp["lang"] == "en":
+                    langlist.append(tmp["lang"])
+                else:
+                    # 因无法区别中日文汉字,以用户输入为准
+                    langlist.append(language)
+                textlist.append(tmp["text"])
+        print(textlist)
+        print(langlist)
+        phones_list = []
+        bert_list = []
+        norm_text_list = []
+        for i in range(len(textlist)):
+            lang = langlist[i]
+            phones, word2ph, norm_text = clean_text_inf(textlist[i], lang)
+            bert = get_bert_inf(phones, word2ph, norm_text, lang)
+            phones_list.append(phones)
+            norm_text_list.append(norm_text)
+            bert_list.append(bert)
+        bert = torch.cat(bert_list, dim=1)
+        phones = sum(phones_list, [])
+        norm_text = ''.join(norm_text_list)
+
+    return phones,bert.to(dtype),norm_text
+
+
+def get_bert_inf(phones, word2ph, norm_text, language):
+    language=language.replace("all_","")
+    if language == "zh":
+        bert = get_bert_feature(norm_text, word2ph).to(device)#.to(dtype)
+    else:
+        bert = torch.zeros(
+            (1024, len(phones)),
+            dtype=torch.float16 if is_half == True else torch.float32,
+        ).to(device)
+
+    return bert
+
+
+def clean_text_inf(text, language):
+    phones, word2ph, norm_text = clean_text(text, language)
+    phones = cleaned_text_to_sequence(phones)
+    return phones, word2ph, norm_text
+
+def get_first(text):
+    pattern = "[" + "".join(re.escape(sep) for sep in splits) + "]"
+    text = re.split(pattern, text)[0].strip()
+    return text
+
+def merge_short_text_in_array(texts, threshold):
+    if (len(texts)) < 2:
+        return texts
+    result = []
+    text = ""
+    for ele in texts:
+        text += ele
+        if len(text) >= threshold:
+            result.append(text)
+            text = ""
+    if (len(text) > 0):
+        if len(result) == 0:
+            result.append(text)
+        else:
+            result[len(result) - 1] += text
+    return result
+
+dtype=torch.float16 if is_half == True else torch.float32
+
+def get_phones_and_bert(text,language):
+    if language in {"en","all_zh","all_ja"}:
+        language = language.replace("all_","")
+        if language == "en":
+            LangSegment.setfilters(["en"])
+            formattext = " ".join(tmp["text"] for tmp in LangSegment.getTexts(text))
+        else:
+            # 因无法区别中日文汉字,以用户输入为准
+            formattext = text
+        while "  " in formattext:
+            formattext = formattext.replace("  ", " ")
+        phones, word2ph, norm_text = clean_text_inf(formattext, language)
+        if language == "zh":
+            bert = get_bert_feature(norm_text, word2ph).to(device)
+        else:
+            bert = torch.zeros(
+                (1024, len(phones)),
+                dtype=torch.float16 if is_half == True else torch.float32,
+            ).to(device)
+    elif language in {"zh", "ja","auto"}:
+        textlist=[]
+        langlist=[]
+        LangSegment.setfilters(["zh","ja","en"])
+        if language == "auto":
+            for tmp in LangSegment.getTexts(text):
+                langlist.append(tmp["lang"])
+                textlist.append(tmp["text"])
+        else:
+            for tmp in LangSegment.getTexts(text):
+                if tmp["lang"] == "en":
+                    langlist.append(tmp["lang"])
+                else:
+                    # 因无法区别中日文汉字,以用户输入为准
+                    langlist.append(language)
+                textlist.append(tmp["text"])
+        print(textlist)
+        print(langlist)
+        phones_list = []
+        bert_list = []
+        norm_text_list = []
+        for i in range(len(textlist)):
+            lang = langlist[i]
+            phones, word2ph, norm_text = clean_text_inf(textlist[i], lang)
+            bert = get_bert_inf(phones, word2ph, norm_text, lang)
+            phones_list.append(phones)
+            norm_text_list.append(norm_text)
+            bert_list.append(bert)
+        bert = torch.cat(bert_list, dim=1)
+        phones = sum(phones_list, [])
+        norm_text = ''.join(norm_text_list)
+
+    return phones,bert.to(dtype),norm_text
+
+def split(todo_text):
+    todo_text = todo_text.replace("……", "。").replace("——", "，")
+    if todo_text[-1] not in splits:
+        todo_text += "。"
+    i_split_head = i_split_tail = 0
+    len_text = len(todo_text)
+    todo_texts = []
+    while 1:
+        if i_split_head >= len_text:
+            break  # 结尾一定有标点，所以直接跳出即可，最后一段在上次已加入
+        if todo_text[i_split_head] in splits:
+            i_split_head += 1
+            todo_texts.append(todo_text[i_split_tail:i_split_head])
+            i_split_tail = i_split_head
+        else:
+            i_split_head += 1
+    return todo_texts
+
+
+def cut1(inp):
+    inp = inp.strip("\n")
+    inps = split(inp)
+    split_idx = list(range(0, len(inps), 4))
+    split_idx[-1] = None
+    if len(split_idx) > 1:
+        opts = []
+        for idx in range(len(split_idx) - 1):
+            opts.append("".join(inps[split_idx[idx]: split_idx[idx + 1]]))
+    else:
+        opts = [inp]
+    return "\n".join(opts)
+
+
+def cut2(inp):
+    inp = inp.strip("\n")
+    inps = split(inp)
+    if len(inps) < 2:
+        return inp
+    opts = []
+    summ = 0
+    tmp_str = ""
+    for i in range(len(inps)):
+        summ += len(inps[i])
+        tmp_str += inps[i]
+        if summ > 50:
+            summ = 0
+            opts.append(tmp_str)
+            tmp_str = ""
+    if tmp_str != "":
+        opts.append(tmp_str)
+    # print(opts)
+    if len(opts) > 1 and len(opts[-1]) < 50:  ##如果最后一个太短了，和前一个合一起
+        opts[-2] = opts[-2] + opts[-1]
+        opts = opts[:-1]
+    return "\n".join(opts)
+
+
+def cut3(inp):
+    inp = inp.strip("\n")
+    return "\n".join(["%s" % item for item in inp.strip("。").split("。")])
+
+
+def cut4(inp):
+    inp = inp.strip("\n")
+    return "\n".join(["%s" % item for item in inp.strip(".").split(".")])
+
+
+# contributed by https://github.com/AI-Hobbyist/GPT-SoVITS/blob/main/GPT_SoVITS/inference_webui.py
+def cut5(inp):
+    # if not re.search(r'[^\w\s]', inp[-1]):
+    # inp += '。'
+    inp = inp.strip("\n")
+    punds = r'[,.;?!、，。？！;：…]'
+    items = re.split(f'({punds})', inp)
+    mergeitems = ["".join(group) for group in zip(items[::2], items[1::2])]
+    # 在句子不存在符号或句尾无符号的时候保证文本完整
+    if len(items)%2 == 1:
+        mergeitems.append(items[-1])
+    opt = "\n".join(mergeitems)
+    return opt
+
+
+
+def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, how_to_cut=("不切"), top_k=20, top_p=0.6, temperature=0.6, ref_free = False):
+    if prompt_text is None or len(prompt_text) == 0:
+        ref_free = True
     t0 = ttime()
-    prompt_text = prompt_text.strip("\n")
-    prompt_language, text = prompt_language, text.strip("\n")
-    zero_wav = np.zeros(int(hps.data.sampling_rate * 0.3), dtype=np.float16 if is_half == True else np.float32)
+    prompt_language = dict_language[prompt_language]
+    text_language = dict_language[text_language]
+    if not ref_free:
+        prompt_text = prompt_text.strip("\n")
+        if (prompt_text[-1] not in splits): prompt_text += "。" if prompt_language != "en" else "."
+        print(("实际输入的参考文本:"), prompt_text)
+    text = text.strip("\n")
+    if (text[0] not in splits and len(get_first(text)) < 4): text = "。" + text if text_language != "en" else "." + text
+    
+    print(("实际输入的目标文本:"), text)
+    zero_wav = np.zeros(
+        int(hps.data.sampling_rate * 0.3),
+        dtype=np.float16 if is_half == True else np.float32,
+    )
     with torch.no_grad():
         wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+        if (wav16k.shape[0] > 160000 or wav16k.shape[0] < 48000):
+            raise OSError(("参考音频在3~10秒范围外，请更换！"))
         wav16k = torch.from_numpy(wav16k)
         zero_wav_torch = torch.from_numpy(zero_wav)
-        if (is_half == True):
+        if is_half == True:
             wav16k = wav16k.half().to(device)
             zero_wav_torch = zero_wav_torch.half().to(device)
         else:
             wav16k = wav16k.to(device)
             zero_wav_torch = zero_wav_torch.to(device)
         wav16k = torch.cat([wav16k, zero_wav_torch])
-        ssl_content = ssl_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)  # .float()
+        ssl_content = ssl_model.model(wav16k.unsqueeze(0))[
+            "last_hidden_state"
+        ].transpose(
+            1, 2
+        )  # .float()
         codes = vq_model.extract_latent(ssl_content)
+   
         prompt_semantic = codes[0, 0]
     t1 = ttime()
-    prompt_language = dict_language[prompt_language]
-    text_language = dict_language[text_language]
-    phones1, word2ph1, norm_text1 = clean_text(prompt_text, prompt_language)
-    phones1 = cleaned_text_to_sequence(phones1)
+
+    if (how_to_cut == ("凑四句一切")):
+        text = cut1(text)
+    elif (how_to_cut == ("凑50字一切")):
+        text = cut2(text)
+    elif (how_to_cut == ("按中文句号。切")):
+        text = cut3(text)
+    elif (how_to_cut == ("按英文句号.切")):
+        text = cut4(text)
+    elif (how_to_cut == ("按标点符号切")):
+        text = cut5(text)
+    while "\n\n" in text:
+        text = text.replace("\n\n", "\n")
+    print(("实际输入的目标文本(切句后):"), text)
     texts = text.split("\n")
+    texts = merge_short_text_in_array(texts, 5)
     audio_opt = []
+    if not ref_free:
+        phones1,bert1,norm_text1=get_phones_and_bert(prompt_text, prompt_language)
 
     for text in texts:
-        phones2, word2ph2, norm_text2 = clean_text(text, text_language)
-        phones2 = cleaned_text_to_sequence(phones2)
-        if (prompt_language == "zh"):
-            bert1 = get_bert_feature(norm_text1, word2ph1).to(device)
+        # 解决输入目标文本的空行导致报错的问题
+        if (len(text.strip()) == 0):
+            continue
+        if (text[-1] not in splits): text += "。" if text_language != "en" else "."
+        print(("实际输入的目标文本(每句):"), text)
+        phones2,bert2,norm_text2=get_phones_and_bert(text, text_language)
+        print(("前端处理后的文本(每句):"), norm_text2)
+        if not ref_free:
+            bert = torch.cat([bert1, bert2], 1)
+            all_phoneme_ids = torch.LongTensor(phones1+phones2).to(device).unsqueeze(0)
         else:
-            bert1 = torch.zeros((1024, len(phones1)), dtype=torch.float16 if is_half == True else torch.float32).to(
-                device)
-        if (text_language == "zh"):
-            bert2 = get_bert_feature(norm_text2, word2ph2).to(device)
-        else:
-            bert2 = torch.zeros((1024, len(phones2))).to(bert1)
-        bert = torch.cat([bert1, bert2], 1)
+            bert = bert2
+            all_phoneme_ids = torch.LongTensor(phones2).to(device).unsqueeze(0)
 
-        all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(device).unsqueeze(0)
         bert = bert.to(device).unsqueeze(0)
         all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(device)
         prompt = prompt_semantic.unsqueeze(0).to(device)
@@ -405,29 +673,42 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language)
             pred_semantic, idx = t2s_model.model.infer_panel(
                 all_phoneme_ids,
                 all_phoneme_len,
-                prompt,
+                None if ref_free else prompt,
                 bert,
                 # prompt_phone_len=ph_offset,
-                top_k=config['inference']['top_k'],
-                early_stop_num=hz * max_sec)
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                early_stop_num=hz * max_sec,
+            )
         t3 = ttime()
         # print(pred_semantic.shape,idx)
-        pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)  # .unsqueeze(0)#mq要多unsqueeze一次
+        pred_semantic = pred_semantic[:, -idx:].unsqueeze(
+            0
+        )  # .unsqueeze(0)#mq要多unsqueeze一次
         refer = get_spepc(hps, ref_wav_path)  # .to(device)
-        if (is_half == True):
+        if is_half == True:
             refer = refer.half().to(device)
         else:
             refer = refer.to(device)
         # audio = vq_model.decode(pred_semantic, all_phoneme_ids, refer).detach().cpu().numpy()[0, 0]
-        audio = \
-            vq_model.decode(pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0),
-                            refer).detach().cpu().numpy()[
-                0, 0]  ###试试重建不带上prompt部分
+        audio = (
+            vq_model.decode(
+                pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0), refer
+            )
+                .detach()
+                .cpu()
+                .numpy()[0, 0]
+        )  ###试试重建不带上prompt部分
+        max_audio=np.abs(audio).max()#简单防止16bit爆音
+        if max_audio>1:audio/=max_audio
         audio_opt.append(audio)
         audio_opt.append(zero_wav)
         t4 = ttime()
     print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t3 - t2, t4 - t3))
-    yield hps.data.sampling_rate, (np.concatenate(audio_opt, 0) * 32768).astype(np.int16)
+    yield hps.data.sampling_rate, (np.concatenate(audio_opt, 0) * 32768).astype(
+        np.int16
+    )
 
 
 def handle_control(command):
@@ -457,7 +738,7 @@ def handle_change(path, text, language):
     return JSONResponse({"code": 0, "message": "Success"}, status_code=200)
 
 
-def handle(refer_wav_path, prompt_text, prompt_language, text, text_language):
+def handle(refer_wav_path, prompt_text, prompt_language, text, text_language,top_k,top_p,temperature):  # 
     if (
             refer_wav_path == "" or refer_wav_path is None
             or prompt_text == "" or prompt_text is None
@@ -544,6 +825,10 @@ async def tts_endpoint(request: Request):
         json_post_raw.get("prompt_language"),
         json_post_raw.get("text"),
         json_post_raw.get("text_language"),
+        json_post_raw.get("top_p"),
+        json_post_raw.get("temperature"),
+        json_post_raw.get("top_k"),
+        # json_post_raw.get("")
     )
 
 
@@ -554,8 +839,112 @@ async def tts_endpoint(
         prompt_language: str = None,
         text: str = None,
         text_language: str = None,
+        top_p: float = None,
+        temperature: float = None,
+        top_k: int = None
 ):
-    return handle(refer_wav_path, prompt_text, prompt_language, text, text_language)
+    return handle(refer_wav_path, prompt_text, prompt_language, text, text_language,top_k,top_p,temperature)  # 
+
+
+@app.post("/upload_video")
+async def upload_file(file: UploadFile = File(...)):
+    
+    safe_filename = os.path.basename(file.filename)
+    
+    upload_path = f"uploads/video/"
+    if not os.path.exists(upload_path):
+        os.makedirs(upload_path)
+  
+    try:
+        with open(os.path.join(upload_path, safe_filename), "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except FileNotFoundError:
+        return {"message": "An error occurred while accessing the file."}
+    except PermissionError:
+        return {"message": "Permission denied while uploading the file."}
+    except Exception as e:
+        return {"message": f"An error occurred while uploading the file. {str(e)}"}
+    
+    return {"message": f"Successfully uploaded {safe_filename}."}
+
+@app.post("/upload_text")
+async def upload_file(file: UploadFile = File(...)):
+    
+    safe_filename = os.path.basename(file.filename)
+    
+    upload_path = f"uploads/text/"
+    
+    if not os.path.exists(upload_path):
+        os.makedirs(upload_path)
+  
+    try:
+        with open(os.path.join(upload_path, safe_filename), "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except FileNotFoundError:
+        return {"message": "An error occurred while accessing the file."}
+    except PermissionError:
+        return {"message": "Permission denied while uploading the file."}
+    except Exception as e:
+        return {"message": f"An error occurred while uploading the file. {str(e)}"}
+    
+    return {"message": f"Successfully uploaded {safe_filename}."}
+
+@app.post('/test_list_files')
+def list_files():
+    directory = 'uploads/text/'  
+    files = []
+
+    for root, dirs, filenames in os.walk(directory):
+        for filename in filenames:
+            file_path = os.path.join(root, filename)
+            files.append(file_path)
+
+    return jsonify(files)
+
+
+
+@app.get("/video_list_files")
+async def list_files():
+    directory = 'uploads/video/'  
+
+    files = [os.path.join(root, filename)
+             for root, _, filenames in os.walk(directory)
+             for filename in filenames]
+
+    return files
+
+@app.get("/text_list_files")
+async def list_files():
+    directory = 'uploads/text/'
+
+    files = [os.path.join(root, filename)
+             for root, _, filenames in os.walk(directory)
+             for filename in filenames]
+
+    return files
+
+
+@app.get("/GPT_list_files")
+async def list_files():
+    directory = 'GPT_weights'  
+
+    files = [os.path.join(root, filename)
+             for root, _, filenames in os.walk(directory)
+             for filename in filenames]
+
+    return files
+
+@app.get("/SOVITS_list_files")
+async def list_files():
+    directory = 'SoVITS_weights'
+
+    files = [os.path.join(root, filename)
+             for root, _, filenames in os.walk(directory)
+             for filename in filenames]
+
+    return files
+
+
 
 
 if __name__ == "__main__":
