@@ -98,16 +98,21 @@ class TextToSpeechApp(QWidget):
         self.temperatureEdit = QLineEdit("0.6")
         self.setWindowTitle('GPT-Sovits API调用')
         # self.setWindowIcon(QIcon('path/to/your/icon.png'))  # 设置窗口图标
-        self.resize(600, 400)  # 调整窗口大小
+        self.resize(600, 500)  # 调整窗口大小
         self.initUI()
-        self.get_and_display_files()  # 调用该方法以填充文件列表
-        self.getSovitsModelFiles()
-        self.getGPTModelFiles()  # 在初始化时获取 Sovits 模型文件列表
+        # self.get_and_display_files()  # 调用该方法以填充文件列表
+        # self.getSovitsModelFiles()
+        # self.getGPTModelFiles()  # 在初始化时获取 Sovits 模型文件列表
         
         self.formLayout.addRow(QLabel('服务器地址：'), self.serverUrlEdit)
         self.formLayout.addRow(QLabel('服务器端口：'), self.serverPortEdit)
 
     
+    def refreshModelPaths(self):
+        self.getGPTModelFiles()  # 刷新GPT模型文件列表
+        self.getSovitsModelFiles()  # 刷新Sovits模型文件列表
+
+
 
     def uploadFileToServervideo(self):
         # 从输入字段获取服务器地址和端口
@@ -234,8 +239,11 @@ class TextToSpeechApp(QWidget):
     # 创建按钮
         self.refreshButton = QPushButton('刷新参考音频文件列表')
         self.submitButton = QPushButton('开始推理')
-        self.updateModelPathsButton = QPushButton('更新模型路径', self)
+        self.updateModelPathsButton = QPushButton('更换模型', self)
         uploadFileButton = QPushButton('上传参考音频文件')
+        self.refreshModelPathsButton = QPushButton('刷新模型列表')
+        self.initializeButton = QPushButton('连接服务器(第一步必做！！！)')
+        
         
 
     # 添加按钮到布局
@@ -243,6 +251,10 @@ class TextToSpeechApp(QWidget):
         buttonLayout.addWidget(uploadFileButton)
         buttonLayout.addWidget(self.updateModelPathsButton)
         buttonLayout.addWidget(self.submitButton)
+        buttonLayout.addWidget(self.refreshModelPathsButton)
+        
+        self.formLayout.addRow(self.initializeButton)  # 根据您的布局需求添加到界面中
+        self.initializeButton.clicked.connect(self.initializeConnection)
         
 
     # 将按钮布局添加到主布局
@@ -255,6 +267,20 @@ class TextToSpeechApp(QWidget):
         self.updateModelPathsButton.clicked.connect(self.updateModelPaths)
         self.formLayout.addRow(QLabel('GPT模型文件：'), self.gptModelComboBox)
         self.formLayout.addRow(QLabel('Sovits模型文件：'), self.sovitsModelComboBox)
+        self.refreshModelPathsButton.clicked.connect(self.refreshModelPaths)
+
+
+    def initializeConnection(self):
+    # 从输入字段获取服务器地址和端口
+        server_url = self.serverUrlEdit.text().strip()
+        server_port = self.serverPortEdit.text().strip()
+        if not server_url or not server_port:
+            QMessageBox.warning(self, '警告', '服务器地址和端口不能为空。')
+            return
+    # 尝试获取文件列表和模型文件
+        self.get_and_display_files()
+        self.getSovitsModelFiles()
+        self.getGPTModelFiles()
 
     def getGPTModelFiles(self):
     # 从输入字段获取服务器地址和端口
@@ -310,12 +336,14 @@ class TextToSpeechApp(QWidget):
             response = requests.post(full_url, json=data)
             if response.status_code == 200:
                 QMessageBox.information(self, '成功', '模型路径更新成功')
+                self.refreshModelPaths()  # 刷新模型列表
             else:
                 QMessageBox.critical(self, '失败', f'模型路径更新失败: {response.text}')
         except Exception as e:
             QMessageBox.critical(self, '错误', f'请求发送异常: {str(e)}')
         finally:
             self.isUpdatingModel = False  # 无论成功还是失败最后都应该重置标志
+            
 
 
 
