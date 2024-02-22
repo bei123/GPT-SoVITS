@@ -1,0 +1,32 @@
+name: Build and Package Python to EXE  
+  
+on:  
+  push:  
+    branches: [ main ]  
+  pull_request:  
+    branches: [ main ]  
+  
+jobs:  
+  build:  
+    runs-on: windows-latest
+
+  
+    steps:  
+    - uses: actions/checkout@v2  
+    - name: Set up Python  
+      uses: actions/setup-python@v2  
+      with:  
+        python-version: 3.9
+    - name: Install dependencies  
+      run: |  
+        python -m pip install --upgrade pip  
+        pip install -r requirements.txt
+        pip install pyinstaller  
+    - name: Package Python to EXE  
+      run: |  
+        pyinstaller -F -w GPT_SoVITS/pyqt.py
+    - name: Upload artifact  
+      uses: actions/upload-artifact@v2  
+      with:  
+        name: pyqt.exe  
+        path: dist/pyqt.exe
