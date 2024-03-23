@@ -29,6 +29,7 @@ import re
 from fastapi import File, UploadFile
 import shutil
 from flask import Flask, jsonify
+import random
 
 g_config = global_config.Config()
 
@@ -275,30 +276,34 @@ sovits_path = tts_config.vits_weights_path
 
 
 def inference(text, text_lang, 
-              refer_wav_path, prompt_text, 
+              ref_audio_path, prompt_text, 
               prompt_lang, top_k, 
               top_p, temperature, 
               text_split_method, batch_size, 
               speed_factor, ref_text_free,
-              split_bucket
+              split_bucket,fragment_interval,
+              seed,
               ):
-    print("1================",dict_language,text_lang)
+    actual_seed = seed if seed not in [-1, "", None] else random.randrange(1 << 32)
     inputs={
         "text": text,
         "text_lang": dict_language[text_lang],
-        "refer_wav_path": refer_wav_path,
+        "ref_audio_path": ref_audio_path,
         "prompt_text": prompt_text if not ref_text_free else "",
         "prompt_lang": dict_language[prompt_lang],
         "top_k": top_k,
         "top_p": top_p,
         "temperature": temperature,
-        "text_split_method": text_split_method,
+        "text_split_method": cut_method[text_split_method],
         "batch_size":int(batch_size),
         "speed_factor":float(speed_factor),
         "split_bucket":split_bucket,
         "return_fragment":False,
+        "fragment_interval":fragment_interval,
+        "seed":actual_seed,
     }
-    yield next(tts_pipline.run(inputs))
+    for item in tts_pipline.run(inputs):
+        yield item, actual_seed
 
 
 def handle_control(command):
@@ -334,21 +339,33 @@ def handle(text, text_lang,
               top_p, temperature, 
               text_split_method, batch_size, 
               speed_factor, ref_text_free,
-              split_bucket):
+              split_bucket,fragment_interval,seed):
     
-    print("handle=============",text, text_lang)
-    if (
-            refer_wav_path == "" or refer_wav_path is None
-            or prompt_text == "" or prompt_text is None
-            or prompt_lang == "" or prompt_lang is None
-    ):
-        refer_wav_path, prompt_text, prompt_language = (
-            default_refer.path,
-            default_refer.text,
-            default_refer.language,
-        )
-        if not default_refer.is_ready():
-            return JSONResponse({"code": 400, "message": "未指定参考音频且接口无预设"}, status_code=400)
+   # print("handle=============",text, text_lang)
+   # print("音频",refer_wav_path)
+    # 检查是否有必要的参数缺失，并分别返回具体缺失的参数信息
+    if refer_wav_path == "" or refer_wav_path is None:
+        error_message = "缺少必要的参考音频路径。"
+    elif prompt_text == "" or prompt_text is None:
+        error_message = "缺少必要的提示文本。"
+    elif prompt_lang == "" or prompt_lang is None:
+        error_message = "缺少必要的提示语言。"
+    else:
+        error_message = ""
+
+    # 如果有任一必要参数缺失
+    if error_message:
+        # 尝试使用默认参考音频
+        if default_refer.is_ready():
+            refer_wav_path, prompt_text, prompt_lang = (
+                default_refer.path,
+                default_refer.text,
+                default_refer.language,
+            )
+        else:
+            # 如果默认参考音频也不可用，则返回具体缺失的参数信息
+            return JSONResponse({"code": 400, "message": f"未指定参考音频且接口无预设。{error_message}"}, status_code=400)
+
 
     with torch.no_grad():
         
@@ -359,18 +376,16 @@ def handle(text, text_lang,
               top_p, temperature, 
               text_split_method, batch_size, 
               speed_factor, ref_text_free,
-              split_bucket
+              split_bucket,fragment_interval,seed
         )
-        sampling_rate, audio_data = next(gen)
+
+        audio,_ = next(gen)
+    sampling_rate,audio_data=audio
 
     wav = BytesIO()
     sf.write(wav, audio_data, sampling_rate, format="wav")
     wav.seek(0)
-
     torch.cuda.empty_cache()
-    if device == "mps":
-        print('executed torch.mps.empty_cache()')
-        torch.mps.empty_cache()
     return StreamingResponse(wav, media_type="audio/wav")
 
 
@@ -523,14 +538,6 @@ async def list_files():
 @app.post("/")
 async def tts_endpoint(request: Request):
     json_post_raw = await request.json()
-    
-    # handle(text, text_lang, 
-    #           refer_wav_path, prompt_text, 
-    #           prompt_lang, top_k, 
-    #           top_p, temperature, 
-    #           text_split_method, batch_size, 
-    #           speed_factor, ref_text_free,
-    #           split_bucket):
 
     return handle(
         json_post_raw.get("text"),
@@ -538,8 +545,6 @@ async def tts_endpoint(request: Request):
         json_post_raw.get("refer_wav_path"),
         json_post_raw.get("prompt_text"),
         json_post_raw.get("prompt_lang"),
-       
-        
         json_post_raw.get("top_k"),
         json_post_raw.get("top_p"),
         json_post_raw.get("temperature"),
@@ -548,6 +553,8 @@ async def tts_endpoint(request: Request):
         json_post_raw.get("speed_factor"),
         json_post_raw.get("ref_text_free"),
         json_post_raw.get("split_bucket"),
+        json_post_raw.get("fragment_interval"),
+        json_post_raw.get("seed")
     )
 
 
@@ -566,18 +573,18 @@ async def tts_endpoint(
         speed_factor: float = None,
         ref_text_free: bool = None,
         split_bucket: bool = None,
-        
-        
-        
+        fragment_interval: float = None,
+        seed: int = None,
 ):
+    
     return handle(text, text_lang, 
               refer_wav_path, prompt_text, 
               prompt_lang, top_k, 
               top_p, temperature, 
               text_split_method, batch_size, 
               speed_factor, ref_text_free,
-              split_bucket)
+              split_bucket,fragment_interval,seed)
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=host, port=port, workers=1)
+    uvicorn.run("api:app", host=host, port=port, workers=1)  # 增加工作进程的数量
