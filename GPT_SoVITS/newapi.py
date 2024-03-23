@@ -587,4 +587,4 @@ async def tts_endpoint(
 
 
 if __name__ == "__main__":
-    uvicorn.run("api:app", host=host, port=port, workers=1)  # 增加工作进程的数量
+    uvicorn.run(app, host=host, port=port, workers=1)
