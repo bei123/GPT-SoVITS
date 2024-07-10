@@ -82,7 +82,7 @@ if bert_path is not None:
     tts_config.bert_base_path = bert_path
     
 print(tts_config)
-tts_pipline = TTS(tts_config)
+tts_pipeline = TTS(tts_config)
 gpt_path = tts_config.t2s_weights_path
 sovits_path = tts_config.vits_weights_path
 
@@ -93,8 +93,11 @@ def inference(text, text_lang,
               text_split_method, batch_size, 
               speed_factor, ref_text_free,
               split_bucket,fragment_interval,
-              seed,
+              seed, keep_random, parallel_infer,
+              repetition_penalty
               ):
+
+    seed = -1 if keep_random else seed
     actual_seed = seed if seed not in [-1, "", None] else random.randrange(1 << 32)
     inputs={
         "text": text,
@@ -112,8 +115,10 @@ def inference(text, text_lang,
         "return_fragment":False,
         "fragment_interval":fragment_interval,
         "seed":actual_seed,
+        "parallel_infer": parallel_infer,
+        "repetition_penalty": repetition_penalty,
     }
-    for item in tts_pipline.run(inputs):
+    for item in tts_pipeline.run(inputs):
         yield item, actual_seed
         
 def custom_sort_key(s):
@@ -162,8 +167,8 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
             SoVITS_dropdown = gr.Dropdown(label=i18n("SoVITS模型列表"), choices=sorted(SoVITS_names, key=custom_sort_key), value=sovits_path, interactive=True)
             refresh_button = gr.Button(i18n("刷新模型路径"), variant="primary")
             refresh_button.click(fn=change_choices, inputs=[], outputs=[SoVITS_dropdown, GPT_dropdown])
-            SoVITS_dropdown.change(tts_pipline.init_vits_weights, [SoVITS_dropdown], [])
-            GPT_dropdown.change(tts_pipline.init_t2s_weights, [GPT_dropdown], [])
+            SoVITS_dropdown.change(tts_pipeline.init_vits_weights, [SoVITS_dropdown], [])
+            GPT_dropdown.change(tts_pipeline.init_t2s_weights, [GPT_dropdown], [])
     
     with gr.Row():
         with gr.Column():
@@ -197,6 +202,7 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                 top_k = gr.Slider(minimum=1,maximum=100,step=1,label=i18n("top_k"),value=5,interactive=True)
                 top_p = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("top_p"),value=1,interactive=True)
                 temperature = gr.Slider(minimum=0,maximum=1,step=0.05,label=i18n("temperature"),value=1,interactive=True)
+                repetition_penalty = gr.Slider(minimum=0,maximum=2,step=0.05,label=i18n("重复惩罚"),value=1.35,interactive=True)
             with gr.Column():
                 how_to_cut = gr.Radio(
                     label=i18n("怎么切"),
@@ -205,8 +211,11 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                     interactive=True,
                 )
                 with gr.Row():
-                    split_bucket = gr.Checkbox(label=i18n("数据分桶(可能会降低一点计算量，选就对了)"), value=True, interactive=True, show_label=True)
+                    parallel_infer = gr.Checkbox(label=i18n("并行推理(速度更快，但可能增大复读概率)"), value=True, interactive=True, show_label=True)
+                    split_bucket = gr.Checkbox(label=i18n("数据分桶(并行推理时会降低一点计算量)"), value=True, interactive=True, show_label=True)
                     seed = gr.Number(label=i18n("随机种子"),value=-1)
+                    keep_random = gr.Checkbox(label=i18n("保持随机"), value=True, interactive=True, show_label=True)
+
             # with gr.Column():
                 output = gr.Audio(label=i18n("输出的语音"))
                 with gr.Row():
@@ -223,11 +232,12 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                 how_to_cut, batch_size, 
                 speed_factor, ref_text_free,
                 split_bucket,fragment_interval,
-                seed
+                seed, keep_random, parallel_infer,
+                repetition_penalty
              ],
             [output, seed],
         )
-        stop_infer.click(tts_pipline.stop, [], [])
+        stop_infer.click(tts_pipeline.stop, [], [])
 
     with gr.Group():
         gr.Markdown(value=i18n("文本切分工具。太长的文本合成出来效果不一定好，所以太长建议先切。合成会根据文本的换行分开合成再拼起来。"))

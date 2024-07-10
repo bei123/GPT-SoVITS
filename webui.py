@@ -85,7 +85,7 @@ if if_gpu_ok and len(gpu_infos) > 0:
 else:
     gpu_info = ("%s\t%s" % ("0", "CPU"))
     gpu_infos.append("%s\t%s" % ("0", "CPU"))
-    default_batch_size = psutil.virtual_memory().total/ 1024 / 1024 / 1024 / 2
+    default_batch_size = int(psutil.virtual_memory().total/ 1024 / 1024 / 1024 / 2)
 gpus = "-".join([i[0] for i in gpu_infos])
 
 pretrained_sovits_name="GPT_SoVITS/pretrained_models/s2G488k.pth"
@@ -418,7 +418,10 @@ def open1a(inp_text,inp_wav_dir,exp_name,gpu_numbers,bert_pretrained_dir):
         with open(path_text, "w", encoding="utf8") as f:
             f.write("\n".join(opt) + "\n")
         ps1a=[]
-        yield "文本进程结束",{"__type__":"update","visible":True},{"__type__":"update","visible":False}
+        if len("".join(opt)) > 0:
+            yield "文本进程成功", {"__type__": "update", "visible": True}, {"__type__": "update", "visible": False}
+        else:
+            yield "文本进程失败", {"__type__": "update", "visible": True}, {"__type__": "update", "visible": False}
     else:
         yield "已有正在进行的文本任务，需先终止才能开启下一次任务", {"__type__": "update", "visible": False}, {"__type__": "update", "visible": True}
 
@@ -583,7 +586,7 @@ def open1abc(inp_text,inp_wav_dir,exp_name,gpu_numbers1a,gpu_numbers1Ba,gpu_numb
                     os.remove(txt_path)
                 with open(path_text, "w",encoding="utf8") as f:
                     f.write("\n".join(opt) + "\n")
-
+                assert len("".join(opt)) > 0, "1Aa-文本获取进程失败"
             yield "进度：1a-done", {"__type__": "update", "visible": False}, {"__type__": "update", "visible": True}
             ps1abc=[]
             #############################1b
