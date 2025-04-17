@@ -26,6 +26,15 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.path2 = "%s/2-name2text.txt" % exp_dir
         self.path4 = "%s/4-cnhubert" % exp_dir
         self.path5 = "%s/5-wav32k" % exp_dir
+        
+        # 检查是否存在带有i_part后缀的文件
+        if not os.path.exists(self.path2):
+            # 尝试查找带有i_part后缀的文件
+            i_part_files = [f for f in os.listdir(exp_dir) if f.startswith("2-name2text-") and f.endswith(".txt")]
+            if i_part_files:
+                # 如果找到，使用第一个文件
+                self.path2 = os.path.join(exp_dir, i_part_files[0])
+        
         assert os.path.exists(self.path2)
         assert os.path.exists(self.path4)
         assert os.path.exists(self.path5)

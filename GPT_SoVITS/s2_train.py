@@ -18,6 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import shutil
 
 logging.getLogger("matplotlib").setLevel(logging.INFO)
 logging.getLogger("h5py").setLevel(logging.INFO)
@@ -235,12 +236,12 @@ def run(rank, n_gpus, hps):
             print(
                 "loaded pretrained %s" % hps.train.pretrained_s2G,
                 net_g.module.load_state_dict(
-                    torch.load(hps.train.pretrained_s2G, map_location="cpu")["weight"],
+                    torch.load(hps.train.pretrained_s2G, map_location="cpu", weights_only=False)["weight"],
                     strict=False,
                 )
                 if torch.cuda.is_available()
                 else net_g.load_state_dict(
-                    torch.load(hps.train.pretrained_s2G, map_location="cpu")["weight"],
+                    torch.load(hps.train.pretrained_s2G, map_location="cpu", weights_only=False)["weight"],
                     strict=False,
                 ),
             )  ##测试不加载优化器
@@ -254,11 +255,13 @@ def run(rank, n_gpus, hps):
             print(
                 "loaded pretrained %s" % hps.train.pretrained_s2D,
                 net_d.module.load_state_dict(
-                    torch.load(hps.train.pretrained_s2D, map_location="cpu")["weight"],
+                    torch.load(hps.train.pretrained_s2D, map_location="cpu", weights_only=False)["weight"],
+                    strict=False,
                 )
                 if torch.cuda.is_available()
                 else net_d.load_state_dict(
-                    torch.load(hps.train.pretrained_s2D, map_location="cpu")["weight"],
+                    torch.load(hps.train.pretrained_s2D, map_location="cpu", weights_only=False)["weight"],
+                    strict=False,
                 ),
             )
 
@@ -509,6 +512,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     )
         global_step += 1
     if epoch % hps.train.save_every_epoch == 0 and rank == 0:
+        # 确保日志目录存在
+        log_dir = os.path.join(hps.data.exp_dir, f"logs_s2_{hps.model.version}")
+        os.makedirs(log_dir, exist_ok=True)
+        
         if hps.train.if_save_latest == 0:
             utils.save_checkpoint(
                 net_g,
@@ -516,7 +523,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 hps.train.learning_rate,
                 epoch,
                 os.path.join(
-                    "%s/logs_s2_%s" % (hps.data.exp_dir, hps.model.version),
+                    log_dir,
                     "G_{}.pth".format(global_step),
                 ),
             )
@@ -526,7 +533,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 hps.train.learning_rate,
                 epoch,
                 os.path.join(
-                    "%s/logs_s2_%s" % (hps.data.exp_dir, hps.model.version),
+                    log_dir,
                     "D_{}.pth".format(global_step),
                 ),
             )
@@ -537,7 +544,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 hps.train.learning_rate,
                 epoch,
                 os.path.join(
-                    "%s/logs_s2_%s" % (hps.data.exp_dir, hps.model.version),
+                    log_dir,
                     "G_{}.pth".format(233333333333),
                 ),
             )
@@ -547,7 +554,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 hps.train.learning_rate,
                 epoch,
                 os.path.join(
-                    "%s/logs_s2_%s" % (hps.data.exp_dir, hps.model.version),
+                    log_dir,
                     "D_{}.pth".format(233333333333),
                 ),
             )
@@ -674,6 +681,52 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         audio_sampling_rate=hps.data.sampling_rate,
     )
     generator.train()
+
+
+def my_save(model, optimizer, scheduler, scaler, epoch, step, dir, name):
+    """保存检查点，确保目标目录存在"""
+    try:
+        # 确保目标目录存在
+        os.makedirs(dir, exist_ok=True)
+        
+        # 使用完整路径创建临时文件和最终文件的路径
+        final_path = os.path.join(dir, name)
+        tmp_path = os.path.join(dir, f"tmp_{name}")
+        
+        # 保存检查点到临时文件
+        print(f"正在保存临时文件到: {tmp_path}")
+        torch.save(
+            {
+                "weight": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "step": step,
+            },
+            tmp_path,
+        )
+        
+        # 移动到最终位置
+        print(f"正在移动临时文件到最终位置: {final_path}")
+        if os.path.exists(final_path):
+            os.remove(final_path)  # 如果目标文件已存在，先删除
+        shutil.move(tmp_path, final_path)
+        print(f"检查点保存成功: {final_path}")
+        
+    except Exception as e:
+        print(f"保存检查点时出错: {str(e)}")
+        # 清理临时文件
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+        raise
+
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, dir, name):
+    """保存检查点的包装函数"""
+    my_save(model, optimizer, scheduler, scaler, epoch, step, dir, name)
 
 
 if __name__ == "__main__":

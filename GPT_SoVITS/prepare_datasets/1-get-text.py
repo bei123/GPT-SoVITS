@@ -141,3 +141,12 @@ if os.path.exists(txt_path) == False:
         opt.append("%s\t%s\t%s\t%s" % (name, phones, word2ph, norm_text))
     with open(txt_path, "w", encoding="utf8") as f:
         f.write("\n".join(opt) + "\n")
+
+# 在脚本末尾添加以下代码，创建一个不带i_part后缀的链接文件
+if os.path.exists(txt_path):
+    # 创建一个不带i_part后缀的链接文件
+    link_path = "%s/2-name2text.txt" % (opt_dir)
+    if not os.path.exists(link_path):
+        # 如果文件不存在，则创建一个链接
+        with open(txt_path, 'r', encoding='utf-8') as src, open(link_path, 'w', encoding='utf-8') as dst:
+            dst.write(src.read())

@@ -2,9 +2,14 @@ train:
   seed: 1234
   epochs: 20
   batch_size: 8
-  save_every_n_epoch: 1
+  save_every_n_epoch: 5
+  if_save_latest: True
+  if_save_every_weights: True
+  if_dpo: False
+  half_weights_save_dir: "SoVITS_weights_v2"
   precision: 16-mixed
   gradient_clip: 1.0
+  exp_name: "test_APi5"
 optimizer:
   lr: 0.01
   lr_init: 0.00001
