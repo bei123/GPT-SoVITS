@@ -162,7 +162,7 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 import numpy as np
 from feature_extractor import cnhubert
 from io import BytesIO
-from module.models import SynthesizerTrn, SynthesizerTrnV3
+from module.models import SynthesizerTrn, SynthesizerTrnV3,Generator
 from peft import LoraConfig, PeftModel, get_peft_model
 from AR.models.t2s_lightning_module import Text2SemanticLightningModule
 from text import cleaned_text_to_sequence
@@ -180,7 +180,11 @@ from typing import Dict, Any, Optional, Tuple
 import gc
 import threading
 import weakref
-# from torch.profiler import profile, record_function, ProfilerActivity
+import asyncio
+from fastapi.middleware.cors import CORSMiddleware
+
+# 添加全局变量
+model_version = "v2"  # 默认版本
 
 class DefaultRefer:
     def __init__(self, path, text, language):
@@ -207,12 +211,21 @@ def is_full(*items):  # 任意一项为空返回False
 
 
 def init_bigvgan():
-    global bigvgan_model
+    global bigvgan_model,hifigan_model
     from BigVGAN import bigvgan
-    bigvgan_model = bigvgan.BigVGAN.from_pretrained("%s/GPT_SoVITS/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x" % (now_dir,), use_cuda_kernel=True)  # if True, RuntimeError: Ninja is required to load C++ extensions
+
+    bigvgan_model = bigvgan.BigVGAN.from_pretrained(
+        "%s/GPT_SoVITS/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x" % (now_dir,),
+        use_cuda_kernel=False,
+    )  # if True, RuntimeError: Ninja is required to load C++ extensions
     # remove weight norm in the model and set to eval mode
     bigvgan_model.remove_weight_norm()
     bigvgan_model = bigvgan_model.eval()
+    if hifigan_model:
+        hifigan_model=hifigan_model.cpu()
+        hifigan_model=None
+        try:torch.cuda.empty_cache()
+        except:pass
     if is_half == True:
         bigvgan_model = bigvgan_model.half().to(device)
     else:
@@ -220,13 +233,12 @@ def init_bigvgan():
 
 
 resample_transform_dict={}
-def resample(audio_tensor, sr0):
+def resample(audio_tensor, sr0,sr1):
     global resample_transform_dict
-    if sr0 not in resample_transform_dict:
-        resample_transform_dict[sr0] = torchaudio.transforms.Resample(
-            sr0, 24000
-        ).to(device)
-    return resample_transform_dict[sr0](audio_tensor)
+    key="%s-%s"%(sr0,sr1)
+    if key not in resample_transform_dict:
+        resample_transform_dict[key] = torchaudio.transforms.Resample(sr0, sr1).to(device)
+    return resample_transform_dict[key](audio_tensor)
 
 
 from module.mel_processing import spectrogram_torch,mel_spectrogram_torch
@@ -246,6 +258,20 @@ mel_fn=lambda x: mel_spectrogram_torch(x, **{
     "fmax": None,
     "center": False
 })
+
+mel_fn_v4 = lambda x: mel_spectrogram_torch(
+    x,
+    **{
+        "n_fft": 1280,
+        "win_size": 1280,
+        "hop_size": 320,
+        "num_mels": 100,
+        "sampling_rate": 32000,
+        "fmin": 0,
+        "fmax": None,
+        "center": False,
+    },
+)
 
 
 sr_model=None
@@ -401,11 +427,15 @@ def load_sovits_model(model_name, device, is_half=False):
             raise FileNotFoundError(f"SoVITS模型文件不存在: {sovits_path}")
         
         path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
+        path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
         is_exist_s2gv3 = os.path.exists(path_sovits_v3)
+        is_exist_s2gv4 = os.path.exists(path_sovits_v4)
         
         version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
         if if_lora_v3 and not is_exist_s2gv3:
             raise FileNotFoundError("SoVITS V3 底模缺失，无法加载相应 LoRA 权重")
+        if model_version == "v4" and not is_exist_s2gv4:
+            raise FileNotFoundError("SoVITS V4 底模缺失，无法加载相应模型")
 
         dict_s2 = load_sovits_new(sovits_path)
         hps = DictToAttrRecursive(dict_s2["config"])
@@ -421,18 +451,31 @@ def load_sovits_model(model_name, device, is_half=False):
 
         if model_version == "v3":
             hps.model.version = "v3"
+        elif model_version == "v4":
+            hps.model.version = "v4"
 
         # 创建模型实例
         model_params_dict = vars(hps.model)
-        vq_model = (SynthesizerTrnV3 if model_version == "v3" else SynthesizerTrn)(
-            hps.data.filter_length // 2 + 1,
-            hps.train.segment_size // hps.data.hop_length,
-            n_speakers=hps.data.n_speakers,
-            **model_params_dict
-        )
+        if model_version in ["v3", "v4"]:
+            vq_model = SynthesizerTrnV3(
+                hps.data.filter_length // 2 + 1,
+                hps.train.segment_size // hps.data.hop_length,
+                n_speakers=hps.data.n_speakers,
+                **model_params_dict
+            )
+        else:
+            vq_model = SynthesizerTrn(
+                hps.data.filter_length // 2 + 1,
+                hps.train.segment_size // hps.data.hop_length,
+                n_speakers=hps.data.n_speakers,
+                **model_params_dict
+            )
 
+        # 初始化声码器
         if model_version == "v3":
             init_bigvgan()
+        elif model_version == "v4":
+            init_hifigan()
 
         logger.info(f"模型版本: {hps.model.version}")
 
@@ -448,7 +491,8 @@ def load_sovits_model(model_name, device, is_half=False):
         if not if_lora_v3:
             vq_model.load_state_dict(dict_s2["weight"], strict=False)
         else:
-            vq_model.load_state_dict(load_sovits_new(path_sovits_v3)["weight"], strict=False)
+            path_sovits = path_sovits_v3 if model_version == "v3" else path_sovits_v4
+            vq_model.load_state_dict(load_sovits_new(path_sovits)["weight"], strict=False)
             lora_rank = dict_s2["lora_rank"]
             lora_config = LoraConfig(
                 target_modules=["to_k", "to_q", "to_v", "to_out.0"],
@@ -734,8 +778,41 @@ class DictToAttrRecursive(dict):
             raise AttributeError(f"Attribute {item} not found")
 
 
+def init_hifigan():
+    global hifigan_model,bigvgan_model
+    hifigan_model = Generator(
+        initial_channel=100,
+        resblock="1",
+        resblock_kernel_sizes=[3, 7, 11],
+        resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+        upsample_rates=[10, 6, 2, 2, 2],
+        upsample_initial_channel=512,
+        upsample_kernel_sizes=[20, 12, 4, 4, 4],
+        gin_channels=0, is_bias=True
+    )
+    hifigan_model.eval()
+    hifigan_model.remove_weight_norm()
+    state_dict_g = torch.load("%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,), map_location="cpu")
+    print("loading vocoder",hifigan_model.load_state_dict(state_dict_g))
+    if bigvgan_model:
+        bigvgan_model=bigvgan_model.cpu()
+        bigvgan_model=None
+        try:torch.cuda.empty_cache()
+        except:pass
+    if is_half == True:
+        hifigan_model = hifigan_model.half().to(device)
+    else:
+        hifigan_model = hifigan_model.to(device)
+
+bigvgan_model=hifigan_model=None
+if model_version=="v3":
+    init_bigvgan()
+if model_version=="v4":
+    init_hifigan()
+
+    
 def get_spepc(hps, filename):
-    audio,_ = librosa.load(filename, int(hps.data.sampling_rate))
+    audio, _ = librosa.load(filename, sr=int(hps.data.sampling_rate))
     audio = torch.FloatTensor(audio)
     maxx=audio.abs().max()
     if(maxx>1):
@@ -886,11 +963,11 @@ def only_punc(text):
 
 
 splits = {"，", "。", "？", "！", ",", ".", "?", "!", "~", ":", "：", "—", "…", }
-def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k= 15, top_p = 0.6, temperature = 0.6, speed = 1, inp_refs = None, sample_steps = 32, if_sr = False, spk = "default"):
+def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k= 15, top_p = 0.6, temperature = 0.6, speed = 1, inp_refs = None, sample_steps = 8, if_sr = False, spk = "default"):
     infer_sovits = speaker_list[spk].sovits
     vq_model = infer_sovits.vq_model
     hps = infer_sovits.hps
-    version = vq_model.version
+    model_version = hps.model.version
 
     infer_gpt = speaker_list[spk].gpt
     t2s_model = infer_gpt.t2s_model
@@ -930,7 +1007,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         prompt = prompt_semantic.unsqueeze(0).to(device)
 
         # 处理参考谱
-        if version != "v3":
+        if model_version not in ["v3", "v4"]:
             refers = []
             if inp_refs:
                 for path in inp_refs:
@@ -949,12 +1026,12 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     text_language = dict_language[text_language.lower()]
     
     # 获取音素和BERT特征
-    phones1, bert1, _ = get_phones_and_bert(prompt_text, prompt_language, version)
+    phones1, bert1, _ = get_phones_and_bert(prompt_text, prompt_language, model_version)
     
     # 分割文本处理
     texts = text.split("\n")
-    audio_bytes = BytesIO()
-
+    all_audio = []
+    
     for text in texts:
         # 跳过纯符号文本
         if only_punc(text):
@@ -964,7 +1041,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         if text[-1] not in splits: 
             text += "。" if text_language != "en" else "."
             
-        phones2, bert2, _ = get_phones_and_bert(text, text_language, version)
+        phones2, bert2, _ = get_phones_and_bert(text, text_language, model_version)
         bert = torch.cat([bert1, bert2], 1)
 
         # 准备模型输入
@@ -986,8 +1063,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
             pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
 
         # 根据版本解码音频
-        audio_opt = []
-        if version != "v3":
+        if model_version not in ["v3", "v4"]:
             audio = vq_model.decode(
                 pred_semantic, 
                 torch.LongTensor(phones2).to(device).unsqueeze(0),
@@ -995,34 +1071,29 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                 speed=speed
             ).detach().cpu().numpy()[0, 0]
         else:
-            # v3版本处理
+            refer = get_spepc(hps, ref_wav_path).to(device).to(dtype)
             phoneme_ids0 = torch.LongTensor(phones1).to(device).unsqueeze(0)
             phoneme_ids1 = torch.LongTensor(phones2).to(device).unsqueeze(0)
-            
             fea_ref, ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
-            
-            # 加载参考音频
             ref_audio, sr = torchaudio.load(ref_wav_path)
             ref_audio = ref_audio.to(device).float()
             if ref_audio.shape[0] == 2:
                 ref_audio = ref_audio.mean(0).unsqueeze(0)
-            if sr != 24000:
-                ref_audio = resample(ref_audio, sr)
-                
-            # 计算梅尔谱
-            mel2 = mel_fn(ref_audio)
+            tgt_sr=24000 if model_version=="v3"else 32000
+            if sr != tgt_sr:
+                ref_audio = resample(ref_audio, sr,tgt_sr)
+            mel2 = mel_fn(ref_audio)if model_version=="v3"else mel_fn_v4(ref_audio)
             mel2 = norm_spec(mel2)
-            
-            # 长度处理
             T_min = min(mel2.shape[2], fea_ref.shape[2])
             mel2 = mel2[:, :, :T_min]
             fea_ref = fea_ref[:, :, :T_min]
-            if T_min > 468:
-                mel2 = mel2[:, :, -468:]
-                fea_ref = fea_ref[:, :, -468:]
-                T_min = 468
-            chunk_len = 934 - T_min
-            
+            Tref=468 if model_version=="v3"else 500
+            Tchunk=934 if model_version=="v3"else 1000
+            if T_min > Tref:
+                mel2 = mel2[:, :, -Tref:]
+                fea_ref = fea_ref[:, :, -Tref:]
+                T_min = Tref
+            chunk_len = Tchunk - T_min
             mel2 = mel2.to(dtype)
             fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge, speed)
             
@@ -1050,15 +1121,21 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                 fea_ref = fea_todo_chunk[:, :, -T_min:]
                 cfm_resss.append(cfm_res)
                 
-            cmf_res = torch.cat(cfm_resss, 2)
-            cmf_res = denorm_spec(cmf_res)
+            cfm_res = torch.cat(cfm_resss, 2)
+            cfm_res = denorm_spec(cfm_res)
             
-            # 生成音频
-            if bigvgan_model is None:
-                init_bigvgan()
+            # 初始化声码器
+            if model_version == "v3":
+                if bigvgan_model is None:
+                    init_bigvgan()
+                vocoder_model = bigvgan_model
+            else:  # v4
+                if hifigan_model is None:
+                    init_hifigan()
+                vocoder_model = hifigan_model
                 
             with torch.inference_mode():
-                wav_gen = bigvgan_model(cmf_res)
+                wav_gen = vocoder_model(cfm_res)
                 audio = wav_gen[0][0].cpu().detach().numpy()
 
         # 归一化音频
@@ -1067,213 +1144,46 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
             audio /= max_audio
             
         # 添加静音
-        audio_opt.append(audio)
-        audio_opt.append(zero_wav)
-        audio_opt = np.concatenate(audio_opt, 0)
+        all_audio.append(audio)
+        all_audio.append(zero_wav)
 
-        # 采样率处理
-        sr = hps.data.sampling_rate if version != "v3" else 24000
-        if if_sr and sr == 24000:
-            audio_opt = torch.from_numpy(audio_opt).float().to(device)
-            audio_opt, sr = audio_sr(audio_opt.unsqueeze(0), sr)
-            
-            max_audio = np.abs(audio_opt).max()
-            if max_audio > 1: 
-                audio_opt /= max_audio
-                
-            sr = 48000
+    # 合并所有音频
+    audio_opt = np.concatenate(all_audio, 0)
 
-        # 打包音频
-        if is_int32:
-            audio_bytes = pack_audio(audio_bytes, (audio_opt * 2147483647).astype(np.int32), sr)
-        else:
-            audio_bytes = pack_audio(audio_bytes, (audio_opt * 32768).astype(np.int16), sr)
-            
-        # 流式模式处理
-        if stream_mode == "normal":
-            audio_bytes, audio_chunk = read_clean_buffer(audio_bytes)
-            yield audio_chunk
+    # 采样率处理
+    if model_version in {"v1","v2"}:
+        opt_sr = 32000
+    elif model_version == "v3":
+        opt_sr = 24000
+    else:  # v4
+        opt_sr = 48000
+    
+    if if_sr and opt_sr == 24000:
+        audio_opt = torch.from_numpy(audio_opt).float().to(device)
+        audio_opt, opt_sr = audio_sr(audio_opt.unsqueeze(0), opt_sr)
+        max_audio = np.abs(audio_opt).max()
+        if max_audio > 1:
+            audio_opt /= max_audio
+        opt_sr = 48000
+
+    # 打包音频
+    audio_bytes = BytesIO()
+    if is_int32:
+        audio_bytes = pack_audio(audio_bytes, (audio_opt * 2147483647).astype(np.int32), opt_sr)
+    else:
+        audio_bytes = pack_audio(audio_bytes, (audio_opt * 32768).astype(np.int16), opt_sr)
+    
+    # 流式模式处理
+    if stream_mode == "normal":
+        audio_bytes, audio_chunk = read_clean_buffer(audio_bytes)
+        yield audio_chunk
     
     # 非流式模式处理
     if not stream_mode == "normal": 
         if media_type == "wav":
-            sr = 48000 if if_sr else 24000
-            sr = hps.data.sampling_rate if version != "v3" else sr
-            audio_bytes = pack_wav(audio_bytes, sr)
+            opt_sr = 48000 if if_sr else opt_sr
+            audio_bytes = pack_wav(audio_bytes, opt_sr)
         yield audio_bytes.getvalue()
-
-# def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k=15, top_p=0.6, temperature=0.6, speed=1, inp_refs=None, sample_steps=32, if_sr=False, spk="default"):
-#     # Initialize models and parameters
-#     infer_sovits = speaker_list[spk].sovits
-#     vq_model = infer_sovits.vq_model
-#     hps = infer_sovits.hps
-#     version = vq_model.version
-
-#     infer_gpt = speaker_list[spk].gpt
-#     t2s_model = infer_gpt.t2s_model
-#     max_sec = infer_gpt.max_sec
-
-#     # Start profiling
-#     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-#         with record_function("get_tts_wav"):
-#             t0 = ttime()
-#             prompt_text = prompt_text.strip("\n")
-#             if prompt_text[-1] not in splits:
-#                 prompt_text += "。" if prompt_language != "en" else "."
-#             prompt_language, text = prompt_language, text.strip("\n")
-#             dtype = torch.float16 if is_half else torch.float32
-#             zero_wav = np.zeros(int(hps.data.sampling_rate * 0.3), dtype=np.float16 if is_half else np.float32)
-
-#             with torch.no_grad():
-#                 wav16k, sr = librosa.load(ref_wav_path, sr=16000)
-#                 wav16k = torch.from_numpy(wav16k)
-#                 zero_wav_torch = torch.from_numpy(zero_wav)
-#                 if is_half:
-#                     wav16k = wav16k.half().to(device)
-#                     zero_wav_torch = zero_wav_torch.half().to(device)
-#                 else:
-#                     wav16k = wav16k.to(device)
-#                     zero_wav_torch = zero_wav_torch.to(device)
-#                 wav16k = torch.cat([wav16k, zero_wav_torch])
-#                 ssl_content = ssl_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
-#                 codes = vq_model.extract_latent(ssl_content)
-#                 prompt_semantic = codes[0, 0]
-#                 prompt = prompt_semantic.unsqueeze(0).to(device)
-
-#                 if version != "v3":
-#                     refers = []
-#                     if inp_refs:
-#                         for path in inp_refs:
-#                             try:
-#                                 refer = get_spepc(hps, path).to(dtype).to(device)
-#                                 refers.append(refer)
-#                             except Exception as e:
-#                                 logger.error(e)
-#                     if len(refers) == 0:
-#                         refers = [get_spepc(hps, ref_wav_path).to(dtype).to(device)]
-#                 else:
-#                     refer = get_spepc(hps, ref_wav_path).to(device).to(dtype)
-#                     refers = [refer]
-
-#             t1 = ttime()
-#             prompt_language = dict_language[prompt_language.lower()]
-#             text_language = dict_language[text_language.lower()]
-#             phones1, bert1, norm_text1 = get_phones_and_bert(prompt_text, prompt_language, version)
-#             texts = text.split("\n")
-#             audio_bytes = BytesIO()
-
-#             for text in texts:
-#                 if only_punc(text):
-#                     continue
-
-#                 audio_opt = []
-#                 if text[-1] not in splits:
-#                     text += "。" if text_language != "en" else "."
-
-#                 phones2, bert2, norm_text2 = get_phones_and_bert(text, text_language, version)
-#                 bert = torch.cat([bert1, bert2], 1)
-
-#                 all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(device).unsqueeze(0)
-#                 bert = bert.to(device).unsqueeze(0)
-#                 all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(device)
-#                 t2 = ttime()
-
-#                 with torch.no_grad():
-#                     pred_semantic, idx = t2s_model.model.infer_panel(
-#                         all_phoneme_ids,
-#                         all_phoneme_len,
-#                         prompt,
-#                         bert,
-#                         top_k=top_k,
-#                         top_p=top_p,
-#                         temperature=temperature,
-#                         early_stop_num=hz * max_sec)
-#                     pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
-
-#                 t3 = ttime()
-
-#                 if version != "v3":
-#                     audio = vq_model.decode(pred_semantic, torch.LongTensor(phones2).to(device).unsqueeze(0), refers, speed=speed).detach().cpu().numpy()[0, 0]
-#                 else:
-#                     phoneme_ids0 = torch.LongTensor(phones1).to(device).unsqueeze(0)
-#                     phoneme_ids1 = torch.LongTensor(phones2).to(device).unsqueeze(0)
-#                     fea_ref, ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
-#                     ref_audio, sr = torchaudio.load(ref_wav_path)
-#                     ref_audio = ref_audio.to(device).float()
-#                     if ref_audio.shape[0] == 2:
-#                         ref_audio = ref_audio.mean(0).unsqueeze(0)
-#                     if sr != 24000:
-#                         ref_audio = resample(ref_audio, sr)
-#                     mel2 = mel_fn(ref_audio)
-#                     mel2 = norm_spec(mel2)
-#                     T_min = min(mel2.shape[2], fea_ref.shape[2])
-#                     mel2 = mel2[:, :, :T_min]
-#                     fea_ref = fea_ref[:, :, :T_min]
-#                     if T_min > 468:
-#                         mel2 = mel2[:, :, -468:]
-#                         fea_ref = fea_ref[:, :, -468:]
-#                         T_min = 468
-#                     chunk_len = 934 - T_min
-#                     mel2 = mel2.to(dtype)
-#                     fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge, speed)
-#                     cfm_resss = []
-#                     idx = 0
-#                     while True:
-#                         fea_todo_chunk = fea_todo[:, :, idx:idx + chunk_len]
-#                         if fea_todo_chunk.shape[-1] == 0:
-#                             break
-#                         idx += chunk_len
-#                         fea = torch.cat([fea_ref, fea_todo_chunk], 2).transpose(2, 1)
-#                         cfm_res = vq_model.cfm.inference(fea, torch.LongTensor([fea.size(1)]).to(fea.device), mel2, sample_steps, inference_cfg_rate=0)
-#                         cfm_res = cfm_res[:, :, mel2.shape[2]:]
-#                         mel2 = cfm_res[:, :, -T_min:]
-#                         fea_ref = fea_todo_chunk[:, :, -T_min:]
-#                         cfm_resss.append(cfm_res)
-#                     cmf_res = torch.cat(cfm_resss, 2)
-#                     cmf_res = denorm_spec(cmf_res)
-#                     if bigvgan_model is None:
-#                         init_bigvgan()
-#                     with torch.inference_mode():
-#                         wav_gen = bigvgan_model(cmf_res)
-#                         audio = wav_gen[0][0].cpu().detach().numpy()
-
-#                 max_audio = np.abs(audio).max()
-#                 if max_audio > 1:
-#                     audio /= max_audio
-#                 audio_opt.append(audio)
-#                 audio_opt.append(zero_wav)
-#                 audio_opt = np.concatenate(audio_opt, 0)
-#                 t4 = ttime()
-
-#                 sr = hps.data.sampling_rate if version != "v3" else 24000
-#                 if if_sr and sr == 24000:
-#                     audio_opt = torch.from_numpy(audio_opt).float().to(device)
-#                     audio_opt, sr = audio_sr(audio_opt.unsqueeze(0), sr)
-#                     max_audio = np.abs(audio_opt).max()
-#                     if max_audio > 1:
-#                         audio_opt /= max_audio
-#                     sr = 48000
-
-#                 if is_int32:
-#                     audio_bytes = pack_audio(audio_bytes, (audio_opt * 2147483647).astype(np.int32), sr)
-#                 else:
-#                     audio_bytes = pack_audio(audio_bytes, (audio_opt * 32768).astype(np.int16), sr)
-
-#                 if stream_mode == "normal":
-#                     audio_bytes, audio_chunk = read_clean_buffer(audio_bytes)
-#                     yield audio_chunk
-
-#             if not stream_mode == "normal":
-#                 if media_type == "wav":
-#                     sr = 48000 if if_sr else 24000
-#                     sr = hps.data.sampling_rate if version != "v3" else sr
-#                     audio_bytes = pack_wav(audio_bytes, sr)
-#                 yield audio_bytes.getvalue()
-
-#     # Print profiling results
-#     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-#     prof.export_chrome_trace("trace.json")  # Export profiling results to a file
-
 
 def handle_control(command):
     if command == "restart":
@@ -1386,6 +1296,9 @@ dict_language = {
     "auto_yue": "auto_yue",
 }
 
+# 支持的模型版本
+v3v4set = {"v3", "v4"}
+
 # logger
 logging.config.dictConfig(uvicorn.config.LOGGING_CONFIG)
 logger = logging.getLogger('uvicorn')
@@ -1494,12 +1407,13 @@ else:
 model_name = "paimeng"  # 替换为实际的模型名称
 change_gpt_sovits_weights(model_name=model_name,device=device)
 
-from fastapi.middleware.cors import CORSMiddleware
-
-# --------------------------------
 # 接口部分
 # --------------------------------
 app = FastAPI()
+
+# 创建请求锁，用于限制QQ机器人请求
+qqbot_lock = threading.Lock()
+qqbot_processing = False
 
 # 允许所有来源的请求
 app.add_middleware(
@@ -1526,7 +1440,50 @@ handler.setFormatter(formatter)
 # Add the handler to the logger
 logger.addHandler(handler)
 
+# QQ机器人专用处理函数，带锁机制
+async def handle_qqbot(text, text_language, model_name):
+    global qqbot_processing
+    
+    # 尝试获取锁，如果已经在处理请求，则等待
+    if not qqbot_lock.acquire(blocking=False):
+        logger.info("QQ机器人请求被锁定，等待上一个请求完成")
+        # 等待锁释放
+        while qqbot_processing:
+            await asyncio.sleep(0.5)
+        qqbot_lock.acquire()
+    
+    try:
+        qqbot_processing = True
+        logger.info(f"开始处理QQ机器人请求: {text[:20]}...")
+        
+        # 调用原有的处理函数
+        result = handle(text, text_language, model_name)
+        
+        logger.info("QQ机器人请求处理完成")
+        return result
+    finally:
+        qqbot_processing = False
+        qqbot_lock.release()
 
+# QQ机器人专用端点
+@app.post("/qqbot")
+async def qqbot_tts_endpoint(request: Request):
+    json_post_raw = await request.json()
+    return await handle_qqbot(
+        json_post_raw.get("text"),
+        json_post_raw.get("text_language"),
+        json_post_raw.get("model_name"), 
+    )
+
+@app.get("/qqbot")
+async def qqbot_tts_endpoint(
+        text: str = None,
+        text_language: str = None,
+        model_name: str = None,
+):
+    return await handle_qqbot(text, text_language, model_name)
+
+# 原有的端点保持不变
 @app.post("/set_model")
 async def set_model(request: Request):
     json_post_raw = await request.json()
@@ -1534,7 +1491,6 @@ async def set_model(request: Request):
     return change_gpt_sovits_weights(
         model_name=model_name, 
     )
-
 
 @app.get("/set_model")
 async def set_model(
@@ -1580,7 +1536,7 @@ async def tts_endpoint(request: Request):
     return handle(
         json_post_raw.get("text"),
         json_post_raw.get("text_language"),
-        json_post_raw.get("model_name"), 
+            json_post_raw.get("model_name"), 
     )
 
 
@@ -1601,7 +1557,10 @@ if __name__ == "__main__":
     # profiler = cProfile.Profile()
     # profiler.enable()
 
+    logger.info(f"API服务器已启动，端口: {port}")
+    logger.info(f"QQ机器人专用API端点: /qqbot")
     
+    # 启动主API服务器
     uvicorn.run(app, host=host, port=port, workers=1)
 
     # profiler.disable()
