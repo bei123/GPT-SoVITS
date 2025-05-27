@@ -216,7 +216,7 @@ def init_bigvgan():
 
     bigvgan_model = bigvgan.BigVGAN.from_pretrained(
         "%s/GPT_SoVITS/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x" % (now_dir,),
-        use_cuda_kernel=False,
+        use_cuda_kernel=True,
     )  # if True, RuntimeError: Ninja is required to load C++ extensions
     # remove weight norm in the model and set to eval mode
     bigvgan_model.remove_weight_norm()
@@ -994,14 +994,22 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         if is_half:
             wav16k = wav16k.half().to(device)
             zero_wav_torch = zero_wav_torch.half().to(device)
+            # 确保模型也是半精度
+            vq_model = vq_model.half()
+            t2s_model = t2s_model.half()
         else:
             wav16k = wav16k.to(device)
             zero_wav_torch = zero_wav_torch.to(device)
+            # 确保模型是单精度
+            vq_model = vq_model.float()
+            t2s_model = t2s_model.float()
             
         wav16k = torch.cat([wav16k, zero_wav_torch])
         
         # 提取语义特征
         ssl_content = ssl_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
+        # 确保ssl_content的数据类型与模型匹配
+        ssl_content = ssl_content.to(dtype)
         codes = vq_model.extract_latent(ssl_content)
         prompt_semantic = codes[0, 0]
         prompt = prompt_semantic.unsqueeze(0).to(device)
@@ -1043,6 +1051,9 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
             
         phones2, bert2, _ = get_phones_and_bert(text, text_language, model_version)
         bert = torch.cat([bert1, bert2], 1)
+        
+        # 确保bert特征的数据类型与模型匹配
+        bert = bert.to(dtype)
 
         # 准备模型输入
         all_phoneme_ids = torch.LongTensor(phones1 + phones2).to(device).unsqueeze(0)
