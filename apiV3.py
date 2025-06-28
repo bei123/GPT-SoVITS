@@ -1246,7 +1246,7 @@ def handle(text, text_language,model_name,):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 只需调用一次 `change_gpt_sovits_weights` 函数
-        change_gpt_sovits_weights(model_name, device)
+        change_gpt_sovits_weights(model_name, device, is_half)
         
         nowLoadModelName = model_name
 
@@ -1416,7 +1416,7 @@ else:
     bert_model = bert_model.to(device)
     ssl_model = ssl_model.to(device)
 model_name = "paimeng"  # 替换为实际的模型名称
-change_gpt_sovits_weights(model_name=model_name,device=device)
+change_gpt_sovits_weights(model_name=model_name,device=device,is_half=is_half)
 
 # 接口部分
 # --------------------------------
@@ -1501,6 +1501,8 @@ async def set_model(request: Request):
     model_name = json_post_raw.get("model_name")
     return change_gpt_sovits_weights(
         model_name=model_name, 
+        device=device,
+        is_half=is_half
     )
 
 @app.get("/set_model")
@@ -1508,7 +1510,7 @@ async def set_model(
         model_name: str = None,
         
 ):
-    return change_gpt_sovits_weights(model_name=model_name,device=device, )
+    return change_gpt_sovits_weights(model_name=model_name,device=device,is_half=is_half)
 
 
 @app.post("/control")
