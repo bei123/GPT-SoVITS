@@ -142,7 +142,7 @@ webui_port_uvr5 = 9873
 webui_port_infer_tts = 9872
 webui_port_subfix = 9871
 
-api_port = 9880
+api_port = 6006
 
 
 # Thanks to the contribution of @Karasukaigan and @XXXXRT666
@@ -216,3 +216,66 @@ class Config:
         self.webui_port_subfix = webui_port_subfix
 
         self.api_port = api_port
+        
+        
+        self.modelToPromptText = {
+            "wendi": "他曾经与我一同聆听风的歌唱，一同弹奏蒲公英的诗篇",
+            "shenglilinghua": "这里有别于神里家的布景，移步之间，处处都有新奇感。",
+            "paimeng": "既然罗莎莉亚说足迹上有元素力，用元素视野应该能很清楚地看到吧。",
+            "leidianjiangjun":"我此番也是受神子之邀，体验一下市井游乐的氛围，和各位并无二致。",
+            "keli":"买东西那天也有一个人帮了开了款式，那个人好像叫",
+            "hutao":"本堂主略施小计，你就败下阵来了，嘿嘿。",
+            "ganyu":"但只要最后落在具体的人身上，那，我可以想办法。",
+            "funingna":"太普通了！哼，这种缺乏特色的料理得不到我的认可！",
+            "bachongshenzi":"在这姑且属于人类的社会里，我也不过凭自己兴趣照做而已",
+            "ailixiya":"就这样一直继续下去好吗？这么早起床是为了能早点见到我吗？",
+            "huahuo":"可聪明的人从一开始就不会入局。你瞧，我是不是更聪明一点？",
+            "bufeiyan":"再把精液涂满我的脸，给我自己做一个精液面膜。",
+            "guodegang":"哲宗皇帝的妹夫，这个九大王赵佶又是他的小舅子。",
+            "hanhong":"谁爱知道，我想什么都没所谓，我所有的一切都是通透的。",
+            "zhoujielun":"对，创作不可能无师自通的，我觉得你应该要这样讲啊。",
+            "jok":"怎么样才能维持一段良好的关系？在维持一段关系的时候，是不是要",
+            "yatuoli":"よしよし、みなも。ほら、見てください。",
+            "yangmi":"变得所谓的不好，是一个人的原因或者是一件事的原因。",
+            "sabeining":"并因此，成功破获了一起公安部督办的毒品大案。",
+            "direnjie":"奉天承运，皇帝诏曰，古来圣王治世。",
+            "nigemaiti":"亲爱的朋友们，今天的开幕式现场，我们也荣幸的请到了很多尊贵的来宾，他们是。",
+            "yueyunpeng":"哎呦，您说的对是我记错了，尚九熙确实是师傅郭德纲的徒弟。",
+            "ruoruo":"别看我穷,我可是掌握了一百种犒劳自己的理由。",
+            "xinxiaomeng":"一直病到了月尾,然后我整整一个月,我都没有办法好好的录视频,我就一直在鸽",
+            "jiazi":"刚逛超市去了，买了这么一点。",
+            "km":"だったんですけどあの一つねファッションショーじゃなくて"
+            
+        }
+
+       
+        self.modelToPromptLanguage = {
+            "wendi": "zh",  
+            "shenglilinghua": "zh",  
+            "paimeng": "zh",  
+            "keli":"zh",
+            "leidianjiangjun":"zh",
+            "hutao":"zh",
+            "ganyu":"zh",
+            "funingna":"zh",
+            "bachongshenzi":"zh",
+            "ailixiya":"zh",
+            "huahuo":"zh",
+            "bufeiyan":"zh",
+            "guodegang":"zh",
+            "zhoujielun":"zh",
+            "jok":"zh",
+            "yatuoli":"ja",
+            "hanhong":"zh",
+            "yangmi":"zh",
+            "sabeining":"zh",
+            "direnjie":"zh",
+            "nigemaiti":"zh",
+            "yueyunpeng":"zh",
+            "ruoruo":"zh",
+            "xinxiaomeng":"zh",
+            "jiazi":"zh",
+            "km":"ja"
+            
+        }
+
