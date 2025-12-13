@@ -155,7 +155,7 @@ from time import time as ttime
 import torch, torchaudio
 import librosa
 import soundfile as sf
-from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi import FastAPI, Request, Query, HTTPException, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 from transformers import AutoModelForMaskedLM, AutoTokenizer
@@ -216,7 +216,7 @@ def init_bigvgan():
 
     bigvgan_model = bigvgan.BigVGAN.from_pretrained(
         "%s/GPT_SoVITS/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x" % (now_dir,),
-        use_cuda_kernel=True,
+        use_cuda_kernel=False,
     )  # if True, RuntimeError: Ninja is required to load C++ extensions
     # remove weight norm in the model and set to eval mode
     bigvgan_model.remove_weight_norm()
@@ -432,10 +432,12 @@ def load_sovits_model(model_name, device, is_half=False):
         is_exist_s2gv4 = os.path.exists(path_sovits_v4)
 
         version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
-        model_version = model_version.lower()  # 统一小写
+        # 保存原始 model_version（可能包含大小写，如 v2ProPlus）
+        original_model_version = model_version
+        model_version_lower = model_version.lower()  # 统一小写用于比较
         if if_lora_v3 and not is_exist_s2gv3:
             raise FileNotFoundError("SoVITS V3 底模缺失，无法加载相应 LoRA 权重")
-        if model_version == "v4" and not is_exist_s2gv4:
+        if model_version_lower == "v4" and not is_exist_s2gv4:
             raise FileNotFoundError("SoVITS V4 底模缺失，无法加载相应模型")
 
         dict_s2 = load_sovits_new(sovits_path)
@@ -443,33 +445,55 @@ def load_sovits_model(model_name, device, is_half=False):
             raise RuntimeError("权重文件缺少 config 字段")
         hps = DictToAttrRecursive(dict_s2["config"])
         hps.model.semantic_frame_rate = "25hz"
-        model_params_dict = vars(hps.model)
-        if model_version in ["v3", "v4"]:
-            vq_model = SynthesizerTrnV3(
-                hps.data.filter_length // 2 + 1,
-                hps.train.segment_size // hps.data.hop_length,
-                n_speakers=hps.data.n_speakers,
-                **model_params_dict
-            )
+        
+        # 通过权重文件内容再次确认版本
+        if "enc_p.text_embedding.weight" not in dict_s2["weight"]:
+            hps.model.version = "v2"  # v3model,v2sybomls
+        elif dict_s2["weight"]["enc_p.text_embedding.weight"].shape[0] == 322:
+            hps.model.version = "v1"
         else:
+            hps.model.version = "v2"
+        version = hps.model.version
+        
+        # 处理版本判断和模型初始化
+        if model_version_lower not in v3v4set:
+            if "pro" not in model_version_lower:
+                model_version = version
+            else:
+                # 保持原始大小写的 model_version（如 v2ProPlus）
+                hps.model.version = original_model_version
+                model_version = original_model_version
             vq_model = SynthesizerTrn(
                 hps.data.filter_length // 2 + 1,
                 hps.train.segment_size // hps.data.hop_length,
                 n_speakers=hps.data.n_speakers,
-                **model_params_dict
+                **hps.model,
+            )
+        else:
+            # v3/v4 模型保持原始 model_version
+            hps.model.version = original_model_version
+            model_version = original_model_version
+            vq_model = SynthesizerTrnV3(
+                hps.data.filter_length // 2 + 1,
+                hps.train.segment_size // hps.data.hop_length,
+                n_speakers=hps.data.n_speakers,
+                **hps.model,
             )
 
         # 初始化声码器
-        if model_version == "v3":
+        if model_version_lower == "v3":
             init_bigvgan()
-        elif model_version == "v4":
+        elif model_version_lower == "v4":
             init_hifigan()
 
         logger.info(f"模型版本: {hps.model.version}")
 
         # 清理不需要的模块
-        if "pretrained" not in sovits_path and hasattr(vq_model, 'enc_q'):
-            delattr(vq_model, 'enc_q')
+        if "pretrained" not in sovits_path:
+            try:
+                del vq_model.enc_q
+            except:
+                pass
 
         # 设备转移
         vq_model = vq_model.half().to(device) if is_half else vq_model.to(device)
@@ -506,11 +530,12 @@ def load_gpt_model(model_name, device, is_half=False):
         if not os.path.exists(gpt_path):
             raise FileNotFoundError(f"GPT模型文件不存在: {gpt_path}")
         
-        dict_s1 = torch.load(gpt_path, map_location="cpu")
+        dict_s1 = torch.load(gpt_path, map_location="cpu", weights_only=False)
         config = dict_s1["config"]
         t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
         t2s_model.load_state_dict(dict_s1["weight"])
-        t2s_model = t2s_model.half() if is_half else t2s_model
+        if is_half == True:
+            t2s_model = t2s_model.half()
         t2s_model = t2s_model.to(device)
         t2s_model.eval()
 
@@ -568,6 +593,130 @@ def get_gpt_weights(model_name: str, device: str, is_half: bool = False) -> Gpt:
         gc.collect()
         raise RuntimeError(f"加载GPT模型失败: {str(e)}")
 
+def load_sovits_model_from_path(sovits_path: str, device: str, is_half: bool = False) -> Sovits:
+    """从路径加载SoVITS模型"""
+    try:
+        if not os.path.exists(sovits_path):
+            raise FileNotFoundError(f"SoVITS模型文件不存在: {sovits_path}")
+
+        # 先定义模型版本相关变量
+        path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
+        path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+        is_exist_s2gv3 = os.path.exists(path_sovits_v3)
+        is_exist_s2gv4 = os.path.exists(path_sovits_v4)
+
+        version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
+        # 保存原始 model_version 用于后续判断（可能包含大小写，如 v2ProPlus）
+        original_model_version = model_version
+        model_version_lower = model_version.lower()  # 统一小写用于比较
+        if if_lora_v3 and not is_exist_s2gv3:
+            raise FileNotFoundError("SoVITS V3 底模缺失，无法加载相应 LoRA 权重")
+        if model_version_lower == "v4" and not is_exist_s2gv4:
+            raise FileNotFoundError("SoVITS V4 底模缺失，无法加载相应模型")
+
+        dict_s2 = load_sovits_new(sovits_path)
+        if "config" not in dict_s2:
+            raise RuntimeError("权重文件缺少 config 字段")
+        hps = DictToAttrRecursive(dict_s2["config"])
+        hps.model.semantic_frame_rate = "25hz"
+        
+        # 通过权重文件内容再次确认版本
+        if "enc_p.text_embedding.weight" not in dict_s2["weight"]:
+            hps.model.version = "v2"  # v3model,v2sybomls
+        elif dict_s2["weight"]["enc_p.text_embedding.weight"].shape[0] == 322:
+            hps.model.version = "v1"
+        else:
+            hps.model.version = "v2"
+        version = hps.model.version
+        
+        # 处理版本判断和模型初始化
+        if model_version_lower not in v3v4set:
+            if "pro" not in model_version_lower:
+                model_version = version
+            else:
+                # 保持原始大小写的 model_version（如 v2ProPlus）
+                hps.model.version = original_model_version
+                model_version = original_model_version
+            vq_model = SynthesizerTrn(
+                hps.data.filter_length // 2 + 1,
+                hps.train.segment_size // hps.data.hop_length,
+                n_speakers=hps.data.n_speakers,
+                **hps.model,
+            )
+        else:
+            hps.model.version = original_model_version
+            model_version = original_model_version
+            vq_model = SynthesizerTrnV3(
+                hps.data.filter_length // 2 + 1,
+                hps.train.segment_size // hps.data.hop_length,
+                n_speakers=hps.data.n_speakers,
+                **hps.model,
+            )
+
+        # 初始化声码器
+        if model_version_lower == "v3":
+            init_bigvgan()
+        elif model_version_lower == "v4":
+            init_hifigan()
+
+        logger.info(f"模型版本: {hps.model.version}")
+
+        # 清理不需要的模块
+        if "pretrained" not in sovits_path:
+            try:
+                del vq_model.enc_q
+            except:
+                pass
+
+        # 设备转移
+        vq_model = vq_model.half().to(device) if is_half else vq_model.to(device)
+        vq_model.eval()
+
+        # LoRA 处理
+        if not if_lora_v3:
+            vq_model.load_state_dict(dict_s2["weight"], strict=False)
+        else:
+            path_sovits = path_sovits_v3 if model_version_lower == "v3" else path_sovits_v4
+            vq_model.load_state_dict(load_sovits_new(path_sovits)["weight"], strict=False)
+            lora_rank = dict_s2["lora_rank"]
+            lora_config = LoraConfig(
+                target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+                r=lora_rank,
+                lora_alpha=lora_rank,
+                init_lora_weights=True,
+            )
+            vq_model.cfm = get_peft_model(vq_model.cfm, lora_config)
+            vq_model.load_state_dict(dict_s2["weight"], strict=False)
+            vq_model.cfm = vq_model.cfm.merge_and_unload()
+            vq_model.eval()
+
+        return Sovits(vq_model, hps)
+    
+    except Exception as e:
+        logger.error(f"加载SoVITS模型失败: {str(e)}")
+        raise
+
+def load_gpt_model_from_path(gpt_path: str, device: str, is_half: bool = False) -> Gpt:
+    """从路径加载GPT模型"""
+    try:
+        if not os.path.exists(gpt_path):
+            raise FileNotFoundError(f"GPT模型文件不存在: {gpt_path}")
+        
+        dict_s1 = torch.load(gpt_path, map_location="cpu", weights_only=False)
+        config = dict_s1["config"]
+        t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
+        t2s_model.load_state_dict(dict_s1["weight"])
+        if is_half == True:
+            t2s_model = t2s_model.half()
+        t2s_model = t2s_model.to(device)
+        t2s_model.eval()
+
+        return Gpt(config["data"]["max_sec"], t2s_model)
+    
+    except Exception as e:
+        logger.error(f"加载GPT模型失败: {str(e)}")
+        raise
+
 def change_gpt_sovits_weights(model_name: str, device: str, is_half: bool = False) -> JSONResponse:
     """切换GPT和SoVITS模型权重"""
     start_time = time.time()
@@ -584,6 +733,47 @@ def change_gpt_sovits_weights(model_name: str, device: str, is_half: bool = Fals
     except Exception as e:
         logger.error(f"切换模型失败: {str(e)}, 耗时: {time.time() - start_time:.2f} 秒")
         model_manager._release_gpu_memory()
+        return JSONResponse({"code": 400, "message": str(e)}, status_code=400)
+
+def change_gpt_sovits_weights_from_path(gpt_path: str, sovits_path: str, device: str, is_half: bool = False) -> JSONResponse:
+    """从路径切换GPT和SoVITS模型权重"""
+    start_time = time.time()
+    
+    try:
+        gpt = load_gpt_model_from_path(gpt_path, device, is_half)
+        sovits = load_sovits_model_from_path(sovits_path, device, is_half)
+        
+        speaker_list["default"] = Speaker(name="default", gpt=gpt, sovits=sovits)
+        
+        logger.info(f"change_gpt_sovits_weights_from_path 耗时: {time.time() - start_time:.2f} 秒")
+        return JSONResponse({"code": 0, "message": "Success"}, status_code=200)
+    
+    except Exception as e:
+        logger.error(f"从路径切换模型失败: {str(e)}, 耗时: {time.time() - start_time:.2f} 秒")
+        model_manager._release_gpu_memory()
+        return JSONResponse({"code": 400, "message": str(e)}, status_code=400)
+
+def load_v2ProPlus_models(device: str, is_half: bool = False) -> JSONResponse:
+    """从config.py读取v2ProPlus模型路径并加载"""
+    try:
+        from config import pretrained_gpt_name, pretrained_sovits_name
+        
+        # 从config读取v2ProPlus模型路径
+        gpt_path = pretrained_gpt_name.get("v2ProPlus")
+        sovits_path = pretrained_sovits_name.get("v2ProPlus")
+        
+        if not gpt_path:
+            raise FileNotFoundError("config.py中未找到v2ProPlus的GPT模型路径")
+        if not sovits_path:
+            raise FileNotFoundError("config.py中未找到v2ProPlus的SoVITS模型路径")
+        
+        logger.info(f"从config读取v2ProPlus模型路径 - GPT: {gpt_path}, SoVITS: {sovits_path}")
+        
+        # 使用change_gpt_sovits_weights_from_path加载
+        return change_gpt_sovits_weights_from_path(gpt_path, sovits_path, device, is_half)
+    
+    except Exception as e:
+        logger.error(f"加载v2ProPlus模型失败: {str(e)}")
         return JSONResponse({"code": 400, "message": str(e)}, status_code=400)
 
 def cleanup_resources():
@@ -810,23 +1000,53 @@ def init_sv_cn():
     if sv_cn_model is None:
         sv_cn_model = SV(device, is_half)
 
-def get_spepc(hps, filename, is_v2pro=False):
-    audio, sr0 = librosa.load(filename, sr=int(hps.data.sampling_rate))
-    audio = torch.FloatTensor(audio)
+def get_spepc(hps, filename, dtype=None, device=None, is_v2pro=False):
+    """获取音频的频谱特征，v2Pro/v2ProPlus模型还需要返回16k音频用于sv_emb"""
+    # 如果没有提供dtype和device，使用全局变量
+    if dtype is None:
+        dtype = torch.float16 if is_half else torch.float32
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    sr1 = int(hps.data.sampling_rate)
+    audio, sr0 = torchaudio.load(filename)
+    
+    # 处理采样率转换
+    if sr0 != sr1:
+        audio = audio.to(device)
+        if audio.shape[0] == 2:
+            audio = audio.mean(0).unsqueeze(0)
+        audio = resample(audio, sr0, sr1)
+    else:
+        audio = audio.to(device)
+        if audio.shape[0] == 2:
+            audio = audio.mean(0).unsqueeze(0)
+    
+    # 归一化
     maxx = audio.abs().max()
     if maxx > 1:
         audio /= min(2, maxx)
-    audio_norm = audio.unsqueeze(0)
-    spec = spectrogram_torch(audio_norm, hps.data.filter_length, hps.data.sampling_rate, hps.data.hop_length,
-                             hps.data.win_length, center=False)
+    
+    # 计算频谱
+    spec = spectrogram_torch(
+        audio,
+        hps.data.filter_length,
+        hps.data.sampling_rate,
+        hps.data.hop_length,
+        hps.data.win_length,
+        center=False,
+    )
+    spec = spec.to(dtype)
+    
+    # 与 inference_webui.py 保持一致，总是返回两个值 (spec, audio)
     if is_v2pro:
         # v2Pro/v2ProPlus需要16k音频做sv_emb
-        import torchaudio
-        audio_16k, sr1 = torchaudio.load(filename)
-        if sr1 != 16000:
-            audio_16k = torchaudio.transforms.Resample(sr1, 16000)(audio_16k)
+        # 使用已经处理好的audio，直接重采样到16k
+        audio_16k = resample(audio, sr1, 16000).to(dtype)
         return spec, audio_16k
-    return spec
+    else:
+        # 非 v2Pro 模型也返回 audio（虽然不会被使用）
+        return spec, audio
 
 
 def pack_audio(audio_bytes, data, rate):
@@ -973,7 +1193,14 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     vq_model = infer_sovits.vq_model
     hps = infer_sovits.hps
     model_version = hps.model.version
-    model_version = model_version.lower()  # 统一小写
+    # 对于 v2Pro/v2ProPlus，version 应该使用 hps.model.version（已经是正确的值）
+    # 确保 version 是字符串格式（v1/v2），用于 get_phones_and_bert
+    version = model_version
+    # 如果 model_version 是 "v2Pro" 或 "v2ProPlus"，version 应该是 "v2"
+    if version.lower() in ["v2pro", "v2proplus"]:
+        version = "v2"
+    model_version_lower = model_version.lower()  # 统一小写用于比较
+    logger.info(f"get_tts_wav - model_version: {model_version}, version for get_phones_and_bert: {version}")
 
     infer_gpt = speaker_list[spk].gpt
     t2s_model = infer_gpt.t2s_model
@@ -1020,40 +1247,15 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         prompt_semantic = codes[0, 0]
         prompt = prompt_semantic.unsqueeze(0).to(device)
 
-        is_v2pro = model_version in ["v2pro", "v2proplus"]
-        if model_version not in ["v3", "v4"]:
-            refers = []
-            sv_emb = [] if is_v2pro else None
-            if is_v2pro:
-                init_sv_cn()
-            if inp_refs:
-                for path in inp_refs:
-                    try:
-                        if is_v2pro:
-                            refer, audio_tensor = get_spepc(hps, path, is_v2pro=True)
-                            refers.append(refer.to(dtype).to(device))
-                            sv_emb.append(sv_cn_model.compute_embedding3(audio_tensor.to(device)))
-                        else:
-                            refer = get_spepc(hps, path)
-                            refers.append(refer.to(dtype).to(device))
-                    except Exception as e:
-                        logger.error(e)
-            if len(refers) == 0:
-                if is_v2pro:
-                    refer, audio_tensor = get_spepc(hps, ref_wav_path, is_v2pro=True)
-                    refers = [refer.to(dtype).to(device)]
-                    sv_emb = [sv_cn_model.compute_embedding3(audio_tensor.to(device))]
-                else:
-                    refers = [get_spepc(hps, ref_wav_path).to(dtype).to(device)]
-        else:
-            refer = get_spepc(hps, ref_wav_path).to(device).to(dtype)
+        # 注意：refers 和 sv_emb 应该在循环内处理（与 inference_webui.py 保持一致）
 
     # 语言处理
     prompt_language = dict_language[prompt_language.lower()]
     text_language = dict_language[text_language.lower()]
     
-    # 获取音素和BERT特征
-    phones1, bert1, _ = get_phones_and_bert(prompt_text, prompt_language, model_version)
+    # 获取音素和BERT特征  
+    # 使用 version 变量，与 inference_webui.py 保持一致
+    phones1, bert1, _ = get_phones_and_bert(prompt_text, prompt_language, version)
     
     # 分割文本处理
     texts = text.split("\n")
@@ -1068,7 +1270,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         if text[-1] not in splits: 
             text += "。" if text_language != "en" else "."
             
-        phones2, bert2, _ = get_phones_and_bert(text, text_language, model_version)
+        phones2, bert2, _ = get_phones_and_bert(text, text_language, version)
         bert = torch.cat([bert1, bert2], 1)
         
         # 确保bert特征的数据类型与模型匹配
@@ -1092,8 +1294,31 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                 early_stop_num=hz * max_sec)
             pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
 
-        # 根据版本解码音频
-        if model_version not in ["v3", "v4"]:
+        # 根据版本解码音频（与 inference_webui.py 保持一致，在循环内处理 refers 和 sv_emb）
+        # 使用原始 model_version（保留大小写）进行检查
+        is_v2pro = model_version in {"v2Pro", "v2ProPlus"}
+        if model_version not in v3v4set:
+            refers = []
+            if is_v2pro:
+                sv_emb = []
+                if sv_cn_model == None:
+                    init_sv_cn()
+            if inp_refs:
+                for path in inp_refs:
+                    try:
+                        # get_spepc 总是返回两个值 (spec, audio)，与 inference_webui.py 保持一致
+                        refer, audio_tensor = get_spepc(hps, path, dtype, device, is_v2pro)
+                        refers.append(refer)
+                        if is_v2pro:
+                            sv_emb.append(sv_cn_model.compute_embedding3(audio_tensor))
+                    except Exception as e:
+                        logger.error(e)
+            if len(refers) == 0:
+                # get_spepc 总是返回两个值 (spec, audio)，与 inference_webui.py 保持一致
+                refer, audio_tensor = get_spepc(hps, ref_wav_path, dtype, device, is_v2pro)
+                refers = [refer]
+                if is_v2pro:
+                    sv_emb = [sv_cn_model.compute_embedding3(audio_tensor)]
             if is_v2pro:
                 audio = vq_model.decode(
                     pred_semantic,
@@ -1101,16 +1326,21 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                     refers,
                     speed=speed,
                     sv_emb=sv_emb,
-                ).detach().cpu().numpy()[0, 0]
+                )[0][0]
+                # 转换为 numpy array（与后续处理保持一致）
+                audio = audio.cpu().detach().numpy()
             else:
                 audio = vq_model.decode(
                     pred_semantic, 
                     torch.LongTensor(phones2).to(device).unsqueeze(0),
                     refers,
                     speed=speed
-                ).detach().cpu().numpy()[0, 0]
+                )[0][0]
+                # 转换为 numpy array（与后续处理保持一致）
+                audio = audio.cpu().detach().numpy()
         else:
-            refer = get_spepc(hps, ref_wav_path).to(device).to(dtype)
+            # v3/v4 模型的 get_spepc 也返回两个值，但不需要 audio_tensor
+            refer, _ = get_spepc(hps, ref_wav_path, dtype, device, is_v2pro=False)
             phoneme_ids0 = torch.LongTensor(phones1).to(device).unsqueeze(0)
             phoneme_ids1 = torch.LongTensor(phones2).to(device).unsqueeze(0)
             fea_ref, ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
@@ -1194,7 +1424,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         opt_sr = 32000
     elif model_version == "v3":
         opt_sr = 24000
-    elif model_version in ["v2pro", "v2proplus"]:
+    elif model_version in {"v2Pro", "v2ProPlus"}:
         opt_sr = 32000
         if if_sr:
             audio_opt = torch.from_numpy(audio_opt).float().to(device)
@@ -1229,7 +1459,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     # 非流式模式处理
     if not stream_mode == "normal": 
         if media_type == "wav":
-            opt_sr = 48000 if if_sr and model_version in ["v2pro", "v2proplus"] else opt_sr
+            opt_sr = 48000 if if_sr and model_version in {"v2Pro", "v2ProPlus"} else opt_sr
             audio_bytes = pack_wav(audio_bytes, opt_sr)
         yield audio_bytes.getvalue()
 
@@ -1313,7 +1543,85 @@ def handle(text, text_language,model_name,):
 
     return StreamingResponse(get_tts_wav(refer_wav_path,prompt_text, prompt_language, text,text_language,), media_type="audio/"+media_type)
 
+def cleanup_temp_file(file_path: str):
+    """清理临时文件"""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"已清理临时文件: {file_path}")
+    except Exception as e:
+        logger.warning(f"清理临时文件失败 {file_path}: {str(e)}")
 
+def handle_v2proplus(text, text_language, model_name, ref_wav_path, prompt_text, prompt_language, temp_file_path=None):
+    """处理v2ProPlus模型的TTS请求"""
+    global nowLoadModelName
+    
+    # 检查必要参数
+    if not text or not text_language:
+        return JSONResponse({"code": 400, "message": "缺少必要参数: text, text_language"}, status_code=400)
+    
+    if not ref_wav_path or not prompt_text or not prompt_language:
+        return JSONResponse({"code": 400, "message": "缺少必要参数: ref_wav_path, prompt_text, prompt_language"}, status_code=400)
+    
+    # 检查模型名称是否为v2ProPlus
+    if model_name and model_name.lower() not in ["v2proplus", "v2pro+"]:
+        logger.warning(f"模型名称 {model_name} 不是v2ProPlus，但使用v2ProPlus处理函数")
+    
+    # 判断是否需要加载v2ProPlus模型
+    model_key = "v2ProPlus"
+    if nowLoadModelName != model_key:
+        logger.info(f"====当前加载的模型为: {nowLoadModelName}, 切换为v2ProPlus模型====")
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 加载v2ProPlus模型
+        result = load_v2ProPlus_models(device=device, is_half=is_half)
+        
+        # 检查加载是否成功
+        if result.status_code != 200:
+            return result
+        
+        nowLoadModelName = model_key
+    
+    # 验证文件是否存在
+    if not os.path.exists(ref_wav_path):
+        return JSONResponse({"code": 400, "message": f"参考音频文件不存在: {ref_wav_path}"}, status_code=400)
+    
+    # 文本预处理（使用默认切分符号）
+    text = cut_text(text, default_cut_punc)
+    
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"v2ProPlus生成语音参数====={ref_wav_path}, {prompt_text}, {prompt_language}, {text}, {text_language} at {current_time}")
+    
+    # 调用get_tts_wav合成声音
+    try:
+        # 创建一个包装生成器，在流结束后清理临时文件
+        def audio_generator_with_cleanup():
+            try:
+                for chunk in get_tts_wav(
+                    ref_wav_path=ref_wav_path,
+                    prompt_text=prompt_text,
+                    prompt_language=prompt_language,
+                    text=text,
+                    text_language=text_language,
+                    spk="default"
+                ):
+                    yield chunk
+            finally:
+                # 流结束后清理临时文件
+                if temp_file_path:
+                    cleanup_temp_file(temp_file_path)
+        
+        return StreamingResponse(
+            audio_generator_with_cleanup(),
+            media_type="audio/"+media_type
+        )
+    except Exception as e:
+        # 出错时也要清理临时文件
+        if temp_file_path:
+            cleanup_temp_file(temp_file_path)
+        logger.error(f"生成语音失败: {str(e)}")
+        return JSONResponse({"code": 500, "message": f"生成语音失败: {str(e)}"}, status_code=500)
 
 
 # --------------------------------
@@ -1582,12 +1890,39 @@ async def change_refer(
 
 @app.post("/")
 async def tts_endpoint(request: Request):
-    json_post_raw = await request.json()
-    return handle(
-        json_post_raw.get("text"),
-        json_post_raw.get("text_language"),
+    try:
+        # 检查 Content-Type
+        content_type = request.headers.get("content-type", "").lower()
+        if content_type and "application/json" not in content_type:
+            return JSONResponse(
+                {"code": 400, "message": f"不支持的 Content-Type: {content_type}，期望 application/json"},
+                status_code=400
+            )
+        
+        json_post_raw = await request.json()
+        return handle(
+            json_post_raw.get("text"),
+            json_post_raw.get("text_language"),
             json_post_raw.get("model_name"), 
-    )
+        )
+    except UnicodeDecodeError as e:
+        logger.error(f"请求体编码错误: {str(e)}")
+        return JSONResponse(
+            {"code": 400, "message": "请求体不是有效的 UTF-8 编码。请确保发送的是 JSON 格式的数据，而不是二进制文件。"},
+            status_code=400
+        )
+    except ValueError as e:
+        logger.error(f"JSON 解析错误: {str(e)}")
+        return JSONResponse(
+            {"code": 400, "message": f"JSON 解析错误: {str(e)}"},
+            status_code=400
+        )
+    except Exception as e:
+        logger.error(f"处理请求时发生错误: {str(e)}")
+        return JSONResponse(
+            {"code": 500, "message": f"处理请求时发生错误: {str(e)}"},
+            status_code=500
+        )
 
 
 @app.get("/")
@@ -1597,6 +1932,84 @@ async def tts_endpoint(
         model_name: str = None,
 ):
     return handle(text,model_name,text_language)
+
+@app.post("/v2proplus")
+async def v2proplus_tts_endpoint(
+    ref_wav_file: UploadFile = File(..., description="参考音频文件"),
+    text: str = Form(..., description="要合成的文本"),
+    text_language: str = Form(..., description="文本语言"),
+    prompt_text: str = Form(..., description="参考音频对应的文本"),
+    prompt_language: str = Form(..., description="参考音频语言"),
+    model_name: str = Form("v2ProPlus", description="模型名称"),
+):
+    """v2ProPlus模型TTS端点 - POST (支持文件上传)
+    
+    前端需要使用 multipart/form-data 格式上传：
+    - ref_wav_file: 参考音频文件（wav格式）
+    - text: 要合成的文本
+    - text_language: 文本语言（如：zh, en等）
+    - prompt_text: 参考音频对应的文本
+    - prompt_language: 参考音频语言（如：zh, en等）
+    - model_name: 模型名称（可选，默认为v2ProPlus）
+    """
+    import tempfile
+    import uuid
+    
+    # 创建临时文件保存上传的音频
+    temp_dir = tempfile.gettempdir()
+    temp_filename = f"ref_audio_{uuid.uuid4().hex}.wav"
+    temp_file_path = os.path.join(temp_dir, temp_filename)
+    
+    try:
+        # 验证文件类型
+        if ref_wav_file.content_type and not ref_wav_file.content_type.startswith("audio/"):
+            logger.warning(f"上传的文件类型: {ref_wav_file.content_type}，可能不是音频文件")
+        
+        # 保存上传的文件
+        with open(temp_file_path, "wb") as buffer:
+            content = await ref_wav_file.read()
+            buffer.write(content)
+        
+        logger.info(f"已保存上传的参考音频文件到: {temp_file_path}，文件大小: {len(content)} bytes")
+        
+        # 调用处理函数
+        return handle_v2proplus(
+            text=text,
+            text_language=text_language,
+            model_name=model_name,
+            ref_wav_path=temp_file_path,
+            prompt_text=prompt_text,
+            prompt_language=prompt_language,
+            temp_file_path=temp_file_path,  # 传递临时文件路径以便后续清理
+        )
+    except Exception as e:
+        # 如果出错，确保清理临时文件
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except:
+                pass
+        logger.error(f"处理文件上传失败: {str(e)}")
+        return JSONResponse({"code": 500, "message": f"处理文件上传失败: {str(e)}"}, status_code=500)
+
+@app.get("/v2proplus")
+async def v2proplus_tts_endpoint_get(
+        text: str = None,
+        text_language: str = None,
+        model_name: str = "v2ProPlus",
+        ref_wav_path: str = None,
+        prompt_text: str = None,
+        prompt_language: str = None,
+):
+    """v2ProPlus模型TTS端点 - GET"""
+    return handle_v2proplus(
+        text=text,
+        text_language=text_language,
+        model_name=model_name,
+        ref_wav_path=ref_wav_path,
+        prompt_text=prompt_text,
+        prompt_language=prompt_language,
+    )
 
 
 if __name__ == "__main__":
