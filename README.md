@@ -48,6 +48,8 @@ https://github.com/RVC-Boss/GPT-SoVITS/assets/129054828/05bee1fa-bdd8-4d85-9350-
 
 请不要尬黑GPT-SoVITS推理速度慢，谢谢！
 
+CPU-Optimized Inference Version：https://github.com/baicai-1145/GPT-SoVITS-CPUFast
+
 **User guide: [简体中文](https://www.yuque.com/baicaigongchang1145haoyuangong/ib3g1e) | [English](https://rentry.co/GPT-SoVITS-guide#/)**
 
 ## Installation
@@ -347,7 +349,7 @@ Use v4 from v1/v2/v3 environment:
 
 2. Clone the latest codes from github.
 
-3. Download v4 pretrained models (gsv-v4-pretrained/s2v4.ckpt, and gsv-v4-pretrained/vocoder.pth) from [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main) and put them into `GPT_SoVITS/pretrained_models`.
+3. Download v4 pretrained models (gsv-v4-pretrained/s2v4.pth, and gsv-v4-pretrained/vocoder.pth) from [huggingface](https://huggingface.co/lj1995/GPT-SoVITS/tree/main) and put them into `GPT_SoVITS/pretrained_models`.
 
 ## V2Pro Release Notes
 
