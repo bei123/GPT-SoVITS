@@ -1,7 +1,8 @@
 Param (
-    [Parameter(Mandatory=$true)][ValidateSet("CU126", "CU128", "CPU")][string]$Device,
+    [Parameter(Mandatory=$false)][ValidateSet("CU126", "CU128", "CPU")][string]$Device,
     [Parameter(Mandatory=$true)][ValidateSet("HF", "HF-Mirror", "ModelScope")][string]$Source,
-    [switch]$DownloadUVR5
+    [switch]$DownloadUVR5,
+    [switch]$ModelsOnly
 )
 
 $global:ErrorActionPreference = 'Stop'
@@ -110,16 +111,30 @@ function Invoke-Download {
     )
 
     try {
-        $params = @{
-            Uri = $Uri
+        # Prefer curl.exe: Invoke-WebRequest progress rendering makes large downloads extremely slow.
+        $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+        if ($curl -and $OutFile) {
+            & curl.exe -L --fail --retry 5 --retry-delay 2 -o $OutFile $Uri
+            if ($LASTEXITCODE -ne 0) {
+                throw "curl.exe exited with code $LASTEXITCODE"
+            }
+            return
         }
 
-        if ($OutFile) {
-            $params["OutFile"] = $OutFile
+        $prevProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try {
+            $params = @{
+                Uri = $Uri
+                UseBasicParsing = $true
+            }
+            if ($OutFile) {
+                $params["OutFile"] = $OutFile
+            }
+            $null = Invoke-WebRequest @params -ErrorAction Stop
+        } finally {
+            $ProgressPreference = $prevProgress
         }
-
-        $null = Invoke-WebRequest @params -ErrorAction Stop
-
     } catch {
         Write-Host "Failed to download:" -ForegroundColor Red
         Write-Host "  $Uri"
@@ -136,9 +151,15 @@ function Invoke-Unzip {
 chcp 65001
 Set-Location $PSScriptRoot
 
-Write-Info "Installing FFmpeg & CMake..."
-Invoke-Conda  ffmpeg cmake
-Write-Success "FFmpeg & CMake Installed"
+if (-not $ModelsOnly -and -not $Device) {
+    throw "Device is required unless -ModelsOnly is specified. Valid values: CU126, CU128, CPU"
+}
+
+if (-not $ModelsOnly) {
+    Write-Info "Installing FFmpeg & CMake..."
+    Invoke-Conda  ffmpeg cmake
+    Write-Success "FFmpeg & CMake Installed"
+}
 
 $PretrainedURL  = ""
 $G2PWURL        = ""
@@ -204,6 +225,11 @@ if ($DownloadUVR5) {
         Write-Info "UVR5 Models Exists"
         Write-Info "Skip Downloading UVR5 Models"
     }
+}
+
+if ($ModelsOnly) {
+    Write-Success "Models Download Completed"
+    exit 0
 }
 
 switch ($Device) {

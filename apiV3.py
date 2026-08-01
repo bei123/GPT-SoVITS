@@ -25,6 +25,8 @@
 
 `-hb` - `cnhubert路径`
 `-b` - `bert路径`
+`-cg` - `强制启用 CUDA Graph 加速`
+`-ncg` - `禁用 CUDA Graph 加速（默认：CUDA 且硬件支持则自动开启）`
 
 ## 调用:
 
@@ -410,13 +412,62 @@ class Sovits:
 
 class Gpt:
     """GPT模型封装类"""
-    def __init__(self, max_sec, t2s_model):
+    def __init__(self, max_sec, t2s_model, gpt_path=None):
         self.max_sec = max_sec
         self.t2s_model = t2s_model
+        self.gpt_path = gpt_path
+        self.t2s_model_cudagraph = None
+
+    def get_cudagraph_runner(self, device, is_half):
+        if self.t2s_model_cudagraph is None:
+            if not self.gpt_path:
+                raise RuntimeError("CUDA Graph 需要 gpt_path，当前 Gpt 未记录模型路径")
+            from AR.models.t2s_model_cudagraph import CUDAGraphRunner
+            self.t2s_model_cudagraph = CUDAGraphRunner(
+                CUDAGraphRunner.load_decoder(self.gpt_path),
+                torch.device(device) if not isinstance(device, torch.device) else device,
+                torch.float16 if is_half else torch.float32,
+            )
+        return self.t2s_model_cudagraph
 
 # 全局变量
 speaker_list: Dict[str, Speaker] = {}
 hz = 50
+cuda_graph_supported = False
+use_cuda_graph = False
+
+
+def check_cuda_graph_support(device) -> bool:
+    device_str = str(device)
+    if not device_str.startswith("cuda"):
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability()
+        if major < 7:
+            logger.info("CUDA Graph: GPU compute capability < 7.0, disabled")
+            return False
+        a = torch.randn(2, 2, device="cuda")
+        g = torch.cuda.CUDAGraph()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            b = a * 2
+        torch.cuda.current_stream().wait_stream(s)
+        out = torch.empty_like(b)
+        with torch.cuda.graph(g):
+            out.copy_(a * 2)
+        g.replay()
+        torch.cuda.synchronize()
+        del a, b, out, g, s
+        torch.cuda.empty_cache()
+        logger.info("CUDA Graph: support check passed")
+        return True
+    except Exception as e:
+        logger.info(f"CUDA Graph: support check failed ({e}), disabled")
+        return False
+
 
 from process_ckpt import get_sovits_version_from_path_fast,load_sovits_new
 def load_sovits_model(model_name, device, is_half=False):
@@ -539,7 +590,7 @@ def load_gpt_model(model_name, device, is_half=False):
         t2s_model = t2s_model.to(device)
         t2s_model.eval()
 
-        return Gpt(config["data"]["max_sec"], t2s_model)
+        return Gpt(config["data"]["max_sec"], t2s_model, gpt_path=gpt_path)
     
     except Exception as e:
         logger.error(f"加载GPT模型失败: {str(e)}")
@@ -711,7 +762,7 @@ def load_gpt_model_from_path(gpt_path: str, device: str, is_half: bool = False) 
         t2s_model = t2s_model.to(device)
         t2s_model.eval()
 
-        return Gpt(config["data"]["max_sec"], t2s_model)
+        return Gpt(config["data"]["max_sec"], t2s_model, gpt_path=gpt_path)
     
     except Exception as e:
         logger.error(f"加载GPT模型失败: {str(e)}")
@@ -1283,16 +1334,38 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         
         # 生成语义特征
         with torch.no_grad():
-            pred_semantic, idx = t2s_model.model.infer_panel(
-                all_phoneme_ids,
-                all_phoneme_len,
-                prompt,
-                bert,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                early_stop_num=hz * max_sec)
-            pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
+            if use_cuda_graph and str(device).startswith("cuda"):
+                from AR.models.structs_cudagraph import T2SRequest
+                t2s_runner = infer_gpt.get_cudagraph_runner(device, is_half)
+                t2s_request = T2SRequest(
+                    [all_phoneme_ids.squeeze(0)],
+                    all_phoneme_len,
+                    prompt,
+                    [bert.squeeze(0)],
+                    valid_length=1,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    early_stop_num=hz * max_sec,
+                    use_cuda_graph=True,
+                )
+                t2s_result = t2s_runner.generate(t2s_request)
+                if t2s_result.exception is not None:
+                    logger.error(t2s_result.exception)
+                    logger.error(t2s_result.traceback)
+                    raise RuntimeError("CUDA Graph T2S inference failed") from t2s_result.exception
+                pred_semantic = t2s_result.result[0].unsqueeze(0).unsqueeze(0)
+            else:
+                pred_semantic, idx = t2s_model.model.infer_panel(
+                    all_phoneme_ids,
+                    all_phoneme_len,
+                    prompt,
+                    bert,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    early_stop_num=hz * max_sec)
+                pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
 
         # 根据版本解码音频（与 inference_webui.py 保持一致，在循环内处理 refers 和 sv_emb）
         # 使用原始 model_version（保留大小写）进行检查
@@ -1684,6 +1757,8 @@ parser.add_argument("-cp", "--cut_punc", type=str, default="", help="文本切�
 # 切割常用分句符为 `python ./api.py -cp ".?!。？！"`
 parser.add_argument("-hb", "--hubert_path", type=str, default=g_config.cnhubert_path, help="覆盖config.cnhubert_path")
 parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, help="覆盖config.bert_path")
+parser.add_argument("-cg", "--cuda_graph", action="store_true", default=False, help="强制启用 CUDA Graph 加速（需 CUDA）")
+parser.add_argument("-ncg", "--no_cuda_graph", action="store_true", default=False, help="禁用 CUDA Graph 加速")
 
 args = parser.parse_args()
 sovits_path = args.sovits_path
@@ -1724,6 +1799,16 @@ if args.half_precision:
 if args.full_precision and args.half_precision:
     is_half = g_config.is_half  # 炒饭fallback
 logger.info(f"半精: {is_half}")
+
+# CUDA Graph（默认：硬件支持则自动开启）
+cuda_graph_supported = check_cuda_graph_support(device)
+if args.no_cuda_graph:
+    use_cuda_graph = False
+elif args.cuda_graph:
+    use_cuda_graph = True
+else:
+    use_cuda_graph = cuda_graph_supported
+logger.info(f"CUDA Graph: supported={cuda_graph_supported}, enabled={use_cuda_graph}")
 
 # 流式返回模式
 if args.stream_mode.lower() in ["normal","n"]:
