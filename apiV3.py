@@ -1800,7 +1800,7 @@ if args.full_precision and args.half_precision:
     is_half = g_config.is_half  # 炒饭fallback
 logger.info(f"半精: {is_half}")
 
-# CUDA Graph（默认：硬件支持则自动开启）
+# CUDA Graph（默认：硬件支持则自动开启；短句复读问题已在 t2s_model_cudagraph 修复）
 cuda_graph_supported = check_cuda_graph_support(device)
 if args.no_cuda_graph:
     use_cuda_graph = False

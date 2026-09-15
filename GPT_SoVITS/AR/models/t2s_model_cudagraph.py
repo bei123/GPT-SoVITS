@@ -89,6 +89,13 @@ class KVCacheNHD(nn.Module):
         self.register_buffer(
             "v_cache", torch.zeros(size=cache_shape), persistent=False
         )
+        # Additive mask for decode SDPA: block positions >= valid_len.
+        # Must be a static buffer so CUDA Graph can replay with in-place updates.
+        self.register_buffer(
+            "attn_bias",
+            torch.zeros(1, 1, 1, max_seq_length),
+            persistent=False,
+        )
 
     def update(self, input_pos: Tensor, k_val: Tensor, v_val: Tensor):
         index = (
@@ -105,9 +112,16 @@ class KVCacheNHD(nn.Module):
         v_out.scatter_(1, index, v_val)
         return k_out, v_out
 
+    def set_valid_len(self, valid_len: int):
+        """Allow attending to [0, valid_len), block the rest (incl. zero pads)."""
+        self.attn_bias.zero_()
+        if valid_len < self.max_seq_length:
+            self.attn_bias[..., valid_len:] = float("-inf")
+
     def empty(self):
         self.k_cache.zero_()
         self.v_cache.zero_()
+        self.attn_bias.zero_()
 
     def prefill_kv(self, k_val: Tensor, v_val: Tensor, bs: int):
         self.k_cache[[bs], : k_val.shape[1]] = k_val
@@ -153,7 +167,11 @@ class Attention(nn.Module):
         k_out = k_cache.transpose(1, 2)  # [B, H, max_seq, D]
         v_out = v_cache.transpose(1, 2)  # [B, H, max_seq, D]
 
-        attn = F.scaled_dot_product_attention(q, k_out, v_out)
+        # Critical: without masking, SDPA attends to zero-padded KV slots and
+        # short utterances easily loop/repeat (see RVC-Boss/GPT-SoVITS#2838).
+        attn = F.scaled_dot_product_attention(
+            q, k_out, v_out, attn_mask=kv_cache.attn_bias
+        )
 
         attn = self.dropout.forward(attn)
         attn = attn.transpose(1, 2).reshape(bsz, seqlen, self.hidden_dim)
@@ -416,6 +434,11 @@ class T2SDecoder(nn.Module):
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
 
+        # Align mask with the position used during capture/warmup.
+        valid_len = int(input_pos.reshape(-1)[0].item())
+        for cache in kv_caches:
+            cache.set_valid_len(valid_len)
+
         graph = torch.cuda.CUDAGraph()
 
         with torch.cuda.stream(s):
@@ -476,6 +499,11 @@ class CUDAGraphRunner:
                     )
                     xy_dec = torch.stack([t[[-1]] for t in xy_dec.unbind()])
                 else:
+                    # Keep SDPA mask in sync with current valid KV length (CUDA-graph safe).
+                    valid_len = int(self.input_pos.reshape(-1)[0].item())
+                    for cache in self.kv_cache:
+                        cache.set_valid_len(valid_len)
+
                     if (
                         request.use_cuda_graph
                         and self.graph is None
@@ -503,8 +531,9 @@ class CUDAGraphRunner:
                 logits = decoder.ar_predict_layer(xy_dec[:, -1])
                 self.input_pos.add_(1)
 
-                if idx == 0:
-                    logits[:, -1] = float("-inf")
+                # Match infer_panel_naive: block EOS for the first ~0.4s (10 tokens).
+                if idx < 11:
+                    logits = logits[:, :-1]
 
                 samples = session.sampler.sample(
                     logits=logits,
