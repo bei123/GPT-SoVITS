@@ -165,6 +165,7 @@ import numpy as np
 from feature_extractor import cnhubert
 from io import BytesIO
 from module.models import SynthesizerTrn, SynthesizerTrnV3,Generator
+from module.models_v5 import V5_VERSIONS, synthesize_v5_mel
 from peft import LoraConfig, PeftModel, get_peft_model
 from AR.models.t2s_lightning_module import Text2SemanticLightningModule
 from text import cleaned_text_to_sequence
@@ -418,15 +419,19 @@ class Gpt:
         self.gpt_path = gpt_path
         self.t2s_model_cudagraph = None
 
-    def get_cudagraph_runner(self, device, is_half):
+    def get_cudagraph_runner(self, device, is_half, use_cuda_graph=True, use_flash_attention=True):
         if self.t2s_model_cudagraph is None:
             if not self.gpt_path:
                 raise RuntimeError("CUDA Graph 需要 gpt_path，当前 Gpt 未记录模型路径")
-            from AR.models.t2s_model_cudagraph import CUDAGraphRunner
-            self.t2s_model_cudagraph = CUDAGraphRunner(
-                CUDAGraphRunner.load_decoder(self.gpt_path),
-                torch.device(device) if not isinstance(device, torch.device) else device,
-                torch.float16 if is_half else torch.float32,
+            from tools.acceleration import create_acceleration
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            self.t2s_model_cudagraph = create_acceleration(
+                self.gpt_path,
+                device=dev,
+                dtype=torch.float16 if is_half else torch.float32,
+                max_batch_size=1,
+                use_cuda_graph=use_cuda_graph,
+                use_flash_attention=use_flash_attention,
             )
         return self.t2s_model_cudagraph
 
@@ -435,35 +440,19 @@ speaker_list: Dict[str, Speaker] = {}
 hz = 50
 cuda_graph_supported = False
 use_cuda_graph = False
+use_flash_attention = True
+hifigan_version = None
 
 
 def check_cuda_graph_support(device) -> bool:
-    device_str = str(device)
-    if not device_str.startswith("cuda"):
-        return False
-    if not torch.cuda.is_available():
-        return False
     try:
-        major, _ = torch.cuda.get_device_capability()
-        if major < 7:
-            logger.info("CUDA Graph: GPU compute capability < 7.0, disabled")
-            return False
-        a = torch.randn(2, 2, device="cuda")
-        g = torch.cuda.CUDAGraph()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            b = a * 2
-        torch.cuda.current_stream().wait_stream(s)
-        out = torch.empty_like(b)
-        with torch.cuda.graph(g):
-            out.copy_(a * 2)
-        g.replay()
-        torch.cuda.synchronize()
-        del a, b, out, g, s
-        torch.cuda.empty_cache()
-        logger.info("CUDA Graph: support check passed")
-        return True
+        from tools.acceleration import cuda_graph_available
+        ok = cuda_graph_available(torch.device(device) if not isinstance(device, torch.device) else device)
+        if ok:
+            logger.info("CUDA Graph: support check passed")
+        else:
+            logger.info("CUDA Graph: unavailable on this device/runtime")
+        return ok
     except Exception as e:
         logger.info(f"CUDA Graph: support check failed ({e}), disabled")
         return False
@@ -472,24 +461,17 @@ def check_cuda_graph_support(device) -> bool:
 from process_ckpt import get_sovits_version_from_path_fast,load_sovits_new
 def load_sovits_model(model_name, device, is_half=False):
     try:
+        from config import pretrained_sovits_name
         sovits_path = os.path.join("api_Model", model_name, f"{model_name}.pth")
         if not os.path.exists(sovits_path):
             raise FileNotFoundError(f"SoVITS模型文件不存在: {sovits_path}")
 
-        # 先定义模型版本相关变量
-        path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
-        path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
-        is_exist_s2gv3 = os.path.exists(path_sovits_v3)
-        is_exist_s2gv4 = os.path.exists(path_sovits_v4)
-
         version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
-        # 保存原始 model_version（可能包含大小写，如 v2ProPlus）
         original_model_version = model_version
-        model_version_lower = model_version.lower()  # 统一小写用于比较
-        if if_lora_v3 and not is_exist_s2gv3:
-            raise FileNotFoundError("SoVITS V3 底模缺失，无法加载相应 LoRA 权重")
-        if model_version_lower == "v4" and not is_exist_s2gv4:
-            raise FileNotFoundError("SoVITS V4 底模缺失，无法加载相应模型")
+        path_sovits = pretrained_sovits_name.get(model_version)
+        is_exist_base = bool(path_sovits) and os.path.exists(path_sovits)
+        if if_lora_v3 and not is_exist_base:
+            raise FileNotFoundError(f"SoVITS {model_version} 底模缺失，无法加载相应 LoRA 权重")
 
         dict_s2 = load_sovits_new(sovits_path)
         if "config" not in dict_s2:
@@ -497,23 +479,23 @@ def load_sovits_model(model_name, device, is_half=False):
         hps = DictToAttrRecursive(dict_s2["config"])
         hps.model.semantic_frame_rate = "25hz"
         
-        # 通过权重文件内容再次确认版本
+        # 通过权重文件内容再次确认符号版本
         if "enc_p.text_embedding.weight" not in dict_s2["weight"]:
-            hps.model.version = "v2"  # v3model,v2sybomls
+            hps.model.version = "v2"
         elif dict_s2["weight"]["enc_p.text_embedding.weight"].shape[0] == 322:
             hps.model.version = "v1"
         else:
             hps.model.version = "v2"
         version = hps.model.version
         
-        # 处理版本判断和模型初始化
-        if model_version_lower not in v3v4set:
-            if "pro" not in model_version_lower:
+        if model_version not in v3v4set:
+            if "Pro" not in model_version:
                 model_version = version
             else:
-                # 保持原始大小写的 model_version（如 v2ProPlus）
                 hps.model.version = original_model_version
                 model_version = original_model_version
+                if sv_cn_model is None:
+                    init_sv_cn()
             vq_model = SynthesizerTrn(
                 hps.data.filter_length // 2 + 1,
                 hps.train.segment_size // hps.data.hop_length,
@@ -521,7 +503,6 @@ def load_sovits_model(model_name, device, is_half=False):
                 **hps.model,
             )
         else:
-            # v3/v4 模型保持原始 model_version
             hps.model.version = original_model_version
             model_version = original_model_version
             vq_model = SynthesizerTrnV3(
@@ -531,30 +512,25 @@ def load_sovits_model(model_name, device, is_half=False):
                 **hps.model,
             )
 
-        # 初始化声码器
-        if model_version_lower == "v3":
+        if model_version == "v3":
             init_bigvgan()
-        elif model_version_lower == "v4":
-            init_hifigan()
+        elif model_version in ({"v4"} | V5_VERSIONS):
+            init_hifigan(model_version)
 
         logger.info(f"模型版本: {hps.model.version}")
 
-        # 清理不需要的模块
         if "pretrained" not in sovits_path:
             try:
                 del vq_model.enc_q
             except:
                 pass
 
-        # 设备转移
         vq_model = vq_model.half().to(device) if is_half else vq_model.to(device)
         vq_model.eval()
 
-        # LoRA 处理
         if not if_lora_v3:
             vq_model.load_state_dict(dict_s2["weight"], strict=False)
         else:
-            path_sovits = path_sovits_v3 if model_version == "v3" else path_sovits_v4
             vq_model.load_state_dict(load_sovits_new(path_sovits)["weight"], strict=False)
             lora_rank = dict_s2["lora_rank"]
             lora_config = LoraConfig(
@@ -647,23 +623,16 @@ def get_gpt_weights(model_name: str, device: str, is_half: bool = False) -> Gpt:
 def load_sovits_model_from_path(sovits_path: str, device: str, is_half: bool = False) -> Sovits:
     """从路径加载SoVITS模型"""
     try:
+        from config import pretrained_sovits_name
         if not os.path.exists(sovits_path):
             raise FileNotFoundError(f"SoVITS模型文件不存在: {sovits_path}")
 
-        # 先定义模型版本相关变量
-        path_sovits_v3 = "GPT_SoVITS/pretrained_models/s2Gv3.pth"
-        path_sovits_v4 = "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
-        is_exist_s2gv3 = os.path.exists(path_sovits_v3)
-        is_exist_s2gv4 = os.path.exists(path_sovits_v4)
-
         version, model_version, if_lora_v3 = get_sovits_version_from_path_fast(sovits_path)
-        # 保存原始 model_version 用于后续判断（可能包含大小写，如 v2ProPlus）
         original_model_version = model_version
-        model_version_lower = model_version.lower()  # 统一小写用于比较
-        if if_lora_v3 and not is_exist_s2gv3:
-            raise FileNotFoundError("SoVITS V3 底模缺失，无法加载相应 LoRA 权重")
-        if model_version_lower == "v4" and not is_exist_s2gv4:
-            raise FileNotFoundError("SoVITS V4 底模缺失，无法加载相应模型")
+        path_sovits = pretrained_sovits_name.get(model_version)
+        is_exist_base = bool(path_sovits) and os.path.exists(path_sovits)
+        if if_lora_v3 and not is_exist_base:
+            raise FileNotFoundError(f"SoVITS {model_version} 底模缺失，无法加载相应 LoRA 权重")
 
         dict_s2 = load_sovits_new(sovits_path)
         if "config" not in dict_s2:
@@ -671,23 +640,22 @@ def load_sovits_model_from_path(sovits_path: str, device: str, is_half: bool = F
         hps = DictToAttrRecursive(dict_s2["config"])
         hps.model.semantic_frame_rate = "25hz"
         
-        # 通过权重文件内容再次确认版本
         if "enc_p.text_embedding.weight" not in dict_s2["weight"]:
-            hps.model.version = "v2"  # v3model,v2sybomls
+            hps.model.version = "v2"
         elif dict_s2["weight"]["enc_p.text_embedding.weight"].shape[0] == 322:
             hps.model.version = "v1"
         else:
             hps.model.version = "v2"
         version = hps.model.version
         
-        # 处理版本判断和模型初始化
-        if model_version_lower not in v3v4set:
-            if "pro" not in model_version_lower:
+        if model_version not in v3v4set:
+            if "Pro" not in model_version:
                 model_version = version
             else:
-                # 保持原始大小写的 model_version（如 v2ProPlus）
                 hps.model.version = original_model_version
                 model_version = original_model_version
+                if sv_cn_model is None:
+                    init_sv_cn()
             vq_model = SynthesizerTrn(
                 hps.data.filter_length // 2 + 1,
                 hps.train.segment_size // hps.data.hop_length,
@@ -704,30 +672,25 @@ def load_sovits_model_from_path(sovits_path: str, device: str, is_half: bool = F
                 **hps.model,
             )
 
-        # 初始化声码器
-        if model_version_lower == "v3":
+        if model_version == "v3":
             init_bigvgan()
-        elif model_version_lower == "v4":
-            init_hifigan()
+        elif model_version in ({"v4"} | V5_VERSIONS):
+            init_hifigan(model_version)
 
         logger.info(f"模型版本: {hps.model.version}")
 
-        # 清理不需要的模块
         if "pretrained" not in sovits_path:
             try:
                 del vq_model.enc_q
             except:
                 pass
 
-        # 设备转移
         vq_model = vq_model.half().to(device) if is_half else vq_model.to(device)
         vq_model.eval()
 
-        # LoRA 处理
         if not if_lora_v3:
             vq_model.load_state_dict(dict_s2["weight"], strict=False)
         else:
-            path_sovits = path_sovits_v3 if model_version_lower == "v3" else path_sovits_v4
             vq_model.load_state_dict(load_sovits_new(path_sovits)["weight"], strict=False)
             lora_rank = dict_s2["lora_rank"]
             lora_config = LoraConfig(
@@ -1007,8 +970,11 @@ class DictToAttrRecursive(dict):
             raise AttributeError(f"Attribute {item} not found")
 
 
-def init_hifigan():
-    global hifigan_model,bigvgan_model
+def init_hifigan(version="v4"):
+    global hifigan_model, hifigan_version, bigvgan_model
+    vocoder_version = "v5" if version in V5_VERSIONS else version
+    if hifigan_model is not None and hifigan_version == vocoder_version:
+        return
     hifigan_model = Generator(
         initial_channel=100,
         resblock="1",
@@ -1021,23 +987,32 @@ def init_hifigan():
     )
     hifigan_model.eval()
     hifigan_model.remove_weight_norm()
-    state_dict_g = torch.load("%s/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/vocoder.pth" % (now_dir,), map_location="cpu")
-    print("loading vocoder",hifigan_model.load_state_dict(state_dict_g))
+    state_dict_g = torch.load(
+        "%s/GPT_SoVITS/pretrained_models/gsv-%s-pretrained/vocoder.pth" % (now_dir, vocoder_version),
+        map_location="cpu",
+        weights_only=False,
+    )
+    print("loading vocoder", hifigan_model.load_state_dict(state_dict_g))
     if bigvgan_model:
-        bigvgan_model=bigvgan_model.cpu()
-        bigvgan_model=None
-        try:torch.cuda.empty_cache()
-        except:pass
+        bigvgan_model = bigvgan_model.cpu()
+        bigvgan_model = None
+        try:
+            torch.cuda.empty_cache()
+        except:
+            pass
     if is_half == True:
         hifigan_model = hifigan_model.half().to(device)
     else:
         hifigan_model = hifigan_model.to(device)
+    hifigan_version = vocoder_version
 
 bigvgan_model=hifigan_model=None
 if model_version=="v3":
     init_bigvgan()
 if model_version=="v4":
-    init_hifigan()
+    init_hifigan("v4")
+if model_version in V5_VERSIONS:
+    init_hifigan(model_version)
 
     
 # ===== 1. 顶部引入SV模型 =====
@@ -1239,7 +1214,7 @@ def only_punc(text):
 
 
 splits = {"，", "。", "？", "！", ",", ".", "?", "!", "~", ":", "：", "—", "…", }
-def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k=15, top_p=0.6, temperature=0.6, speed=1, inp_refs=None, sample_steps=8, if_sr=False, spk="default"):
+def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k=15, top_p=0.6, temperature=0.6, speed=1, inp_refs=None, sample_steps=None, if_sr=False, spk="default", cfg_rate=None):
     infer_sovits = speaker_list[spk].sovits
     vq_model = infer_sovits.vq_model
     hps = infer_sovits.hps
@@ -1250,12 +1225,25 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     # 如果 model_version 是 "v2Pro" 或 "v2ProPlus"，version 应该是 "v2"
     if version.lower() in ["v2pro", "v2proplus"]:
         version = "v2"
-    model_version_lower = model_version.lower()  # 统一小写用于比较
     logger.info(f"get_tts_wav - model_version: {model_version}, version for get_phones_and_bert: {version}")
 
     infer_gpt = speaker_list[spk].gpt
     t2s_model = infer_gpt.t2s_model
     max_sec = infer_gpt.max_sec
+
+    if sample_steps is None:
+        sample_steps = 4 if model_version == "v5turbo" else 32 if model_version in {"v3", "v5dev"} else 8
+    if cfg_rate is None:
+        cfg_rate = 1.30 if model_version == "v5dev" else 0.0
+    sample_steps, cfg_rate = int(sample_steps), float(cfg_rate)
+    if model_version == "v3":
+        if sample_steps not in [4, 8, 16, 32, 64, 128]:
+            sample_steps = 32
+    elif model_version == "v4":
+        if sample_steps not in [4, 8, 16, 32]:
+            sample_steps = 8
+    if if_sr and model_version != "v3":
+        if_sr = False
 
     # 预处理文本
     prompt_text = prompt_text.strip("\n")
@@ -1334,27 +1322,29 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         
         # 生成语义特征
         with torch.no_grad():
+            accel = None
+            use_accel = False
             if use_cuda_graph and str(device).startswith("cuda"):
-                from AR.models.structs_cudagraph import T2SRequest
-                t2s_runner = infer_gpt.get_cudagraph_runner(device, is_half)
-                t2s_request = T2SRequest(
-                    [all_phoneme_ids.squeeze(0)],
-                    all_phoneme_len,
-                    prompt,
-                    [bert.squeeze(0)],
-                    valid_length=1,
+                accel = infer_gpt.get_cudagraph_runner(
+                    device, is_half, use_cuda_graph=use_cuda_graph, use_flash_attention=use_flash_attention
+                )
+                use_accel = accel is not None and accel.prepare(use_cuda_graph, use_flash_attention)
+            if use_accel:
+                tokens, token_lengths = accel.infer_batch(
+                    x=[all_phoneme_ids.squeeze(0)],
+                    x_lens=all_phoneme_len,
+                    prompts=prompt,
+                    bert_feature=[bert.squeeze(0)],
+                    parallel_infer=False,
+                    use_cuda_graph=use_cuda_graph,
+                    use_flash_attention=use_flash_attention,
                     top_k=top_k,
                     top_p=top_p,
                     temperature=temperature,
                     early_stop_num=hz * max_sec,
-                    use_cuda_graph=True,
+                    repetition_penalty=1.35,
                 )
-                t2s_result = t2s_runner.generate(t2s_request)
-                if t2s_result.exception is not None:
-                    logger.error(t2s_result.exception)
-                    logger.error(t2s_result.traceback)
-                    raise RuntimeError("CUDA Graph T2S inference failed") from t2s_result.exception
-                pred_semantic = t2s_result.result[0].unsqueeze(0).unsqueeze(0)
+                pred_semantic = tokens[0][: token_lengths[0]].reshape(1, 1, -1)
             else:
                 pred_semantic, idx = t2s_model.model.infer_panel(
                     all_phoneme_ids,
@@ -1412,7 +1402,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                 # 转换为 numpy array（与后续处理保持一致）
                 audio = audio.cpu().detach().numpy()
         else:
-            # v3/v4 模型的 get_spepc 也返回两个值，但不需要 audio_tensor
+            # v3/v4/v5 模型的 get_spepc 也返回两个值，但不需要 audio_tensor
             refer, _ = get_spepc(hps, ref_wav_path, dtype, device, is_v2pro=False)
             phoneme_ids0 = torch.LongTensor(phones1).to(device).unsqueeze(0)
             phoneme_ids1 = torch.LongTensor(phones2).to(device).unsqueeze(0)
@@ -1426,44 +1416,50 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                 ref_audio = resample(ref_audio, sr,tgt_sr)
             mel2 = mel_fn(ref_audio)if model_version=="v3"else mel_fn_v4(ref_audio)
             mel2 = norm_spec(mel2)
-            T_min = min(mel2.shape[2], fea_ref.shape[2])
-            mel2 = mel2[:, :, :T_min]
-            fea_ref = fea_ref[:, :, :T_min]
-            Tref=468 if model_version=="v3"else 500
-            Tchunk=934 if model_version=="v3"else 1000
-            if T_min > Tref:
-                mel2 = mel2[:, :, -Tref:]
-                fea_ref = fea_ref[:, :, -Tref:]
-                T_min = Tref
-            chunk_len = Tchunk - T_min
-            mel2 = mel2.to(dtype)
-            fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge, speed)
-            
-            # 分块处理长音频
-            cfm_resss = []
-            idx = 0
-            while True:
-                fea_todo_chunk = fea_todo[:, :, idx:idx + chunk_len]
-                if fea_todo_chunk.shape[-1] == 0: 
-                    break
+            if model_version in V5_VERSIONS:
+                fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge, speed)
+                cfm_res = synthesize_v5_mel(
+                    vq_model, fea_ref, fea_todo, mel2.to(dtype), sample_steps, cfg_rate
+                ).to(dtype)
+            else:
+                T_min = min(mel2.shape[2], fea_ref.shape[2])
+                mel2 = mel2[:, :, :T_min]
+                fea_ref = fea_ref[:, :, :T_min]
+                Tref=468 if model_version=="v3"else 500
+                Tchunk=934 if model_version=="v3"else 1000
+                if T_min > Tref:
+                    mel2 = mel2[:, :, -Tref:]
+                    fea_ref = fea_ref[:, :, -Tref:]
+                    T_min = Tref
+                chunk_len = Tchunk - T_min
+                mel2 = mel2.to(dtype)
+                fea_todo, ge = vq_model.decode_encp(pred_semantic, phoneme_ids1, refer, ge, speed)
+                
+                # 分块处理长音频
+                cfm_resss = []
+                idx = 0
+                while True:
+                    fea_todo_chunk = fea_todo[:, :, idx:idx + chunk_len]
+                    if fea_todo_chunk.shape[-1] == 0: 
+                        break
+                        
+                    idx += chunk_len
+                    fea = torch.cat([fea_ref, fea_todo_chunk], 2).transpose(2, 1)
                     
-                idx += chunk_len
-                fea = torch.cat([fea_ref, fea_todo_chunk], 2).transpose(2, 1)
-                
-                cfm_res = vq_model.cfm.inference(
-                    fea, 
-                    torch.LongTensor([fea.size(1)]).to(fea.device), 
-                    mel2, 
-                    sample_steps, 
-                    inference_cfg_rate=0
-                )
-                
-                cfm_res = cfm_res[:, :, mel2.shape[2]:]
-                mel2 = cfm_res[:, :, -T_min:]
-                fea_ref = fea_todo_chunk[:, :, -T_min:]
-                cfm_resss.append(cfm_res)
-                
-            cfm_res = torch.cat(cfm_resss, 2)
+                    cfm_res = vq_model.cfm.inference(
+                        fea, 
+                        torch.LongTensor([fea.size(1)]).to(fea.device), 
+                        mel2, 
+                        sample_steps, 
+                        inference_cfg_rate=0
+                    )
+                    
+                    cfm_res = cfm_res[:, :, mel2.shape[2]:]
+                    mel2 = cfm_res[:, :, -T_min:]
+                    fea_ref = fea_todo_chunk[:, :, -T_min:]
+                    cfm_resss.append(cfm_res)
+                    
+                cfm_res = torch.cat(cfm_resss, 2)
             cfm_res = denorm_spec(cfm_res)
             
             # 初始化声码器
@@ -1471,9 +1467,8 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                 if bigvgan_model is None:
                     init_bigvgan()
                 vocoder_model = bigvgan_model
-            else:  # v4
-                if hifigan_model is None:
-                    init_hifigan()
+            else:  # v4 / v5
+                init_hifigan(model_version)
                 vocoder_model = hifigan_model
                 
             with torch.inference_mode():
@@ -1493,20 +1488,11 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     audio_opt = np.concatenate(all_audio, 0)
 
     # 采样率处理
-    if model_version in {"v1","v2"}:
+    if model_version in {"v1","v2","v2Pro","v2ProPlus"}:
         opt_sr = 32000
     elif model_version == "v3":
         opt_sr = 24000
-    elif model_version in {"v2Pro", "v2ProPlus"}:
-        opt_sr = 32000
-        if if_sr:
-            audio_opt = torch.from_numpy(audio_opt).float().to(device)
-            audio_opt, opt_sr = audio_sr(audio_opt.unsqueeze(0), opt_sr)
-            max_audio = np.abs(audio_opt).max()
-            if max_audio > 1:
-                audio_opt /= max_audio
-            opt_sr = 48000
-    else:  # v4
+    else:  # v4 / v5
         opt_sr = 48000
     
     if if_sr and opt_sr == 24000:
@@ -1532,7 +1518,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     # 非流式模式处理
     if not stream_mode == "normal": 
         if media_type == "wav":
-            opt_sr = 48000 if if_sr and model_version in {"v2Pro", "v2ProPlus"} else opt_sr
+            opt_sr = 48000 if if_sr and model_version in {"v2Pro", "v2ProPlus", "v3"} else opt_sr
             audio_bytes = pack_wav(audio_bytes, opt_sr)
         yield audio_bytes.getvalue()
 
@@ -1605,9 +1591,6 @@ def handle(text, text_language,model_name,):
         )
         if not default_refer.is_ready():
             return JSONResponse({"code": 400, "message": "未指定参考音频且接口无预设"}, status_code=400)
-
-        if not sample_steps in [4,8,16,32]:
-         sample_steps = 32
 
     if cut_punc == None:
         text = cut_text(text,default_cut_punc)
@@ -1725,8 +1708,8 @@ dict_language = {
     "auto_yue": "auto_yue",
 }
 
-# 支持的模型版本
-v3v4set = {"v3", "v4"}
+# 支持的扩散/CFM 模型版本（含 V5）
+v3v4set = {"v3", "v4"} | V5_VERSIONS
 
 # logger
 logging.config.dictConfig(uvicorn.config.LOGGING_CONFIG)
@@ -1759,6 +1742,7 @@ parser.add_argument("-hb", "--hubert_path", type=str, default=g_config.cnhubert_
 parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, help="覆盖config.bert_path")
 parser.add_argument("-cg", "--cuda_graph", action="store_true", default=False, help="强制启用 CUDA Graph 加速（需 CUDA）")
 parser.add_argument("-ncg", "--no_cuda_graph", action="store_true", default=False, help="禁用 CUDA Graph 加速")
+parser.add_argument("-nfa", "--no_flash_attention", action="store_true", default=False, help="禁用 FlashAttention 加速后端")
 
 args = parser.parse_args()
 sovits_path = args.sovits_path
@@ -1800,7 +1784,7 @@ if args.full_precision and args.half_precision:
     is_half = g_config.is_half  # 炒饭fallback
 logger.info(f"半精: {is_half}")
 
-# CUDA Graph（默认：硬件支持则自动开启；短句复读问题已在 t2s_model_cudagraph 修复）
+# CUDA Graph（默认：硬件支持则自动开启）
 cuda_graph_supported = check_cuda_graph_support(device)
 if args.no_cuda_graph:
     use_cuda_graph = False
@@ -1808,7 +1792,8 @@ elif args.cuda_graph:
     use_cuda_graph = True
 else:
     use_cuda_graph = cuda_graph_supported
-logger.info(f"CUDA Graph: supported={cuda_graph_supported}, enabled={use_cuda_graph}")
+use_flash_attention = not args.no_flash_attention
+logger.info(f"CUDA Graph: supported={cuda_graph_supported}, enabled={use_cuda_graph}, flash_attn={use_flash_attention}")
 
 # 流式返回模式
 if args.stream_mode.lower() in ["normal","n"]:
