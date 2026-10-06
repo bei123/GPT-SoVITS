@@ -153,7 +153,7 @@ mod = None
 for name in ("flash_attn", "flash_attn_v100"):
     try:
         mod = import_module(name)
-        print(f"[OK] import {name}: {getattr(mod, '__doc__', '')!r[:80]}")
+        print(f"[OK] import {name}: {repr(getattr(mod, '__doc__', ''))[:80]}")
         break
     except Exception as e:
         print(f"[MISS] {name}: {e}")
