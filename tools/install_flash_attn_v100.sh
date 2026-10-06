@@ -117,7 +117,21 @@ if setup.exists() and relax:
         print("[OK] relaxed setup.py CUDA>=12.9 check")
     else:
         print("[INFO] setup.py CUDA check not found / already relaxed")
+
+# 3) mat_mul.h: __tanhf is not a valid device intrinsic on many toolkits
+#    (shows up as host-only). Use tanhf() which has a __device__ overload.
+for header in root.glob("include/**/*.h"):
+    text = header.read_text(encoding="utf-8", errors="ignore")
+    if "__tanhf" not in text:
+        continue
+    text2 = text.replace("__tanhf", "tanhf")
+    header.write_text(text2, encoding="utf-8")
+    print(f"[OK] patched {header}: __tanhf -> tanhf")
 PY
+
+# Clean previous failed objects so ninja rebuilds patched headers
+rm -rf ./build
+echo "[INFO] Cleared build/"
 
 echo "[INFO] Installing build deps (no torch reinstall)..."
 python -m pip install -U pip ninja packaging wheel "setuptools>=70"
