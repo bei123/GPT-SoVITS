@@ -41,20 +41,33 @@ def _flash_attention_module():
             if directory.is_dir():
                 _DLL_HANDLES.append(os.add_dll_directory(str(directory)))
     try:
-        return import_module("flash_attn")
-    except (ImportError, OSError, RuntimeError) as exc:
-        _logger.info("FlashAttention is unavailable: %s", exc)
-        return None
+        from GPT_SoVITS.Accel.flash_attn_resolve import resolve_flash_attn_module
+
+        return resolve_flash_attn_module()
+    except Exception as exc:
+        _logger.info("FlashAttention resolve failed: %s", exc)
+        try:
+            return import_module("flash_attn")
+        except (ImportError, OSError, RuntimeError) as exc2:
+            _logger.info("FlashAttention is unavailable: %s", exc2)
+            return None
 
 
 def flash_attention_available(device, dtype):
     device = torch.device(device)
     if not _cuda_available(device) or dtype not in (torch.float16, torch.bfloat16):
         return False
-    if torch.cuda.get_device_capability(device)[0] < 8:
-        return False
-    module = _flash_attention_module()
-    return callable(getattr(module, "flash_attn_with_kvcache", None))
+    try:
+        from GPT_SoVITS.Accel.flash_attn_resolve import flash_attn_usable
+
+        return flash_attn_usable(device, dtype, min_major=7)
+    except Exception as exc:
+        _logger.info("flash_attention_available fallback: %s", exc)
+        # Legacy gate: official Ampere+
+        if torch.cuda.get_device_capability(device)[0] < 8:
+            return False
+        module = _flash_attention_module()
+        return callable(getattr(module, "flash_attn_with_kvcache", None))
 
 
 def resolve_acceleration(device, dtype, use_cuda_graph=True, use_flash_attention=True):
@@ -79,6 +92,8 @@ def create_acceleration(
         return None
     try:
         from GPT_SoVITS.Accel.adapter import AccelInference
+        # Ensure SM70 ports are aliased before backend import does `import flash_attn`.
+        _flash_attention_module()
         import_module("GPT_SoVITS.Accel.PyTorch.AR.backends." + backend)
     except (ImportError, OSError, RuntimeError) as exc:
         _logger.warning("AR acceleration is unavailable; using ordinary inference: %s", exc)

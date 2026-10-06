@@ -2,7 +2,15 @@
 Modified From https://github.com/XXXXRT666/GPT-SoVITS
 """
 
-import flash_attn  # type: ignore
+try:
+    from GPT_SoVITS.Accel.flash_attn_resolve import resolve_flash_attn_module
+
+    flash_attn = resolve_flash_attn_module()
+    if flash_attn is None:
+        raise ImportError("flash_attn / flash_attn_v100 not available")
+except Exception:
+    import flash_attn  # type: ignore
+
 import torch
 
 from ... import nn

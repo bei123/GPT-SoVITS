@@ -37,12 +37,14 @@ if torch.cuda.is_available() and torch.version.cuda is not None:
     #         sm_version = major + minor / 10.0
     #         if sm_version >= 7.0:
     #             backends.append("sage_attn_varlen_cuda_graph")
-    if importlib.util.find_spec("flash_attn") is not None:
+    if importlib.util.find_spec("flash_attn") is not None or importlib.util.find_spec("flash_attn_v100") is not None:
         for i in range(torch.cuda.device_count()):
             major, minor = torch.cuda.get_device_capability(i)
             sm_version = major + minor / 10.0
-            if sm_version >= 7.5:
+            # Ampere+ official; SM70 needs community flash_attn_v100 (resolved at runtime).
+            if sm_version >= 7.0:
                 backends.append("flash_attn_varlen_cuda_graph")
+                break
 
 BLACKWELL = False
 if torch.cuda.is_available() and torch.version.cuda is not None:

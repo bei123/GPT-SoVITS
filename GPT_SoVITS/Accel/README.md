@@ -33,6 +33,18 @@ Graph 实际捕获失败时，Flash 继续 eager，纯 Torch Graph 回普通 AR�
 
 此处理也适用于 CUDA 12 环境的 Torch DLL。未修改系统 PATH、CUDA_PATH、库版本或 site-packages，未把 G2PW 改成 CPU。UVR5 的 `onnx_dereverb_By_FoxJoy` 创建 ONNX Runtime 会话前也调用同一 DLL 初始化，因此该模型可使用 CUDA/cuDNN。已经运行的推理窗口需要重新启动才能加载修改。
 
+## V100 (SM70) FlashAttention 实验支持
+
+官方 `flash-attn` 不支持 Volta。本仓库可通过社区移植启用：
+
+1. 在 V100 Linux 环境（与当前 PyTorch/CUDA 匹配）执行：
+   `bash tools/install_flash_attn_v100.sh`
+   （默认克隆 [ai-bond/flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)）
+2. 安装成功后重启 WebUI / `apiV3.py`；`tools/acceleration.py` 会对 SM≥7 做 `flash_attn_with_kvcache` smoke test。
+3. 失败或不想用：`export FLASH_ATTN_V100=0`，自动回退 CUDA Graph / 普通 AR。
+
+编译耗时长，且依赖本机 CUDA toolkit 与 torch 版本；不保证所有 AutoDL 镜像一次成功。
+
 ## 兼容与安装
 
 Accel 源码采用 Python 3.9 兼容语法；旧 Torch 不支持的六项 `_inductor.config` 内部设置已移除，权重加载仅在支持时传 `mmap`。语法兼容不代表旧 py39 环境的全部功能已实测。
