@@ -144,6 +144,7 @@ RESP: 无
 
 
 import argparse
+import math
 import os,re
 import sys
 from datetime import datetime
@@ -442,6 +443,7 @@ cuda_graph_supported = False
 use_cuda_graph = False
 use_flash_attention = True
 hifigan_version = None
+v5proplus_inference_lock = threading.Lock()
 
 
 def check_cuda_graph_support(device) -> bool:
@@ -731,7 +733,7 @@ def load_gpt_model_from_path(gpt_path: str, device: str, is_half: bool = False) 
         logger.error(f"加载GPT模型失败: {str(e)}")
         raise
 
-def change_gpt_sovits_weights(model_name: str, device: str, is_half: bool = False) -> JSONResponse:
+def _change_gpt_sovits_weights_unlocked(model_name: str, device: str, is_half: bool = False) -> JSONResponse:
     """切换GPT和SoVITS模型权重"""
     start_time = time.time()
     
@@ -749,7 +751,7 @@ def change_gpt_sovits_weights(model_name: str, device: str, is_half: bool = Fals
         model_manager._release_gpu_memory()
         return JSONResponse({"code": 400, "message": str(e)}, status_code=400)
 
-def change_gpt_sovits_weights_from_path(gpt_path: str, sovits_path: str, device: str, is_half: bool = False) -> JSONResponse:
+def _change_gpt_sovits_weights_from_path_unlocked(gpt_path: str, sovits_path: str, device: str, is_half: bool = False) -> JSONResponse:
     """从路径切换GPT和SoVITS模型权重"""
     start_time = time.time()
     
@@ -767,7 +769,17 @@ def change_gpt_sovits_weights_from_path(gpt_path: str, sovits_path: str, device:
         model_manager._release_gpu_memory()
         return JSONResponse({"code": 400, "message": str(e)}, status_code=400)
 
-def load_v5_models(device: str, is_half: bool = False, version: str = "v5turbo") -> JSONResponse:
+
+def change_gpt_sovits_weights(model_name: str, device: str, is_half: bool = False) -> JSONResponse:
+    with v5proplus_inference_lock:
+        return _change_gpt_sovits_weights_unlocked(model_name, device, is_half)
+
+
+def change_gpt_sovits_weights_from_path(gpt_path: str, sovits_path: str, device: str, is_half: bool = False) -> JSONResponse:
+    with v5proplus_inference_lock:
+        return _change_gpt_sovits_weights_from_path_unlocked(gpt_path, sovits_path, device, is_half)
+
+def load_v5_models(device: str, is_half: bool = False, version: str = "v5turbo", _lock_held: bool = False) -> JSONResponse:
     """从config.py读取 V5 模型路径并加载（供 /v2proplus 等接口使用）"""
     try:
         from config import pretrained_gpt_name, pretrained_sovits_name
@@ -791,6 +803,8 @@ def load_v5_models(device: str, is_half: bool = False, version: str = "v5turbo")
             raise FileNotFoundError(f"SoVITS模型文件不存在: {sovits_path}")
 
         logger.info(f"从config读取{version}模型路径 - GPT: {gpt_path}, SoVITS: {sovits_path}")
+        if _lock_held:
+            return _change_gpt_sovits_weights_from_path_unlocked(gpt_path, sovits_path, device, is_half)
         return change_gpt_sovits_weights_from_path(gpt_path, sovits_path, device, is_half)
 
     except Exception as e:
@@ -1620,7 +1634,7 @@ def cleanup_temp_file(file_path: str):
     except Exception as e:
         logger.warning(f"清理临时文件失败 {file_path}: {str(e)}")
 
-def handle_v2proplus(text, text_language, model_name, ref_wav_path, prompt_text, prompt_language, temp_file_path=None):
+def handle_v2proplus(text, text_language, model_name, ref_wav_path, prompt_text, prompt_language, temp_file_path=None, sample_steps=None, cfg_rate=None):
     """处理 /v2proplus 请求：实际使用 V5 模型（默认 v5turbo）"""
     global nowLoadModelName
     
@@ -1630,6 +1644,18 @@ def handle_v2proplus(text, text_language, model_name, ref_wav_path, prompt_text,
     
     if not ref_wav_path or not prompt_text or not prompt_language:
         return JSONResponse({"code": 400, "message": "缺少必要参数: ref_wav_path, prompt_text, prompt_language"}, status_code=400)
+
+    try:
+        if sample_steps is not None:
+            sample_steps = int(sample_steps)
+            if sample_steps not in {4, 8, 16, 32}:
+                raise ValueError("sample_steps 仅支持 4、8、16、32")
+        if cfg_rate is not None:
+            cfg_rate = float(cfg_rate)
+            if not math.isfinite(cfg_rate) or not 0 <= cfg_rate <= 2:
+                raise ValueError("cfg_rate 必须是 0 到 2 之间的有限数值")
+    except (TypeError, ValueError) as e:
+        return JSONResponse({"code": 400, "message": str(e)}, status_code=400)
 
     # 归一化模型名：旧客户端传 v2ProPlus 时映射到 v5turbo
     raw_name = (model_name or "v5turbo").strip()
@@ -1642,17 +1668,6 @@ def handle_v2proplus(text, text_language, model_name, ref_wav_path, prompt_text,
         logger.warning(f"未知 model_name={model_name}，回退到 v5turbo")
         model_key = "v5turbo"
 
-    if nowLoadModelName != model_key:
-        logger.info(f"====当前加载的模型为: {nowLoadModelName}, 切换为{model_key}模型====")
-        
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        result = load_v5_models(device=device, is_half=is_half, version=model_key)
-        
-        if result.status_code != 200:
-            return result
-        
-        nowLoadModelName = model_key
-    
     # 验证文件是否存在
     if not os.path.exists(ref_wav_path):
         return JSONResponse({"code": 400, "message": f"参考音频文件不存在: {ref_wav_path}"}, status_code=400)
@@ -1667,16 +1682,32 @@ def handle_v2proplus(text, text_language, model_name, ref_wav_path, prompt_text,
     try:
         def audio_generator_with_cleanup():
             try:
-                for chunk in get_tts_wav(
-                    ref_wav_path=ref_wav_path,
-                    prompt_text=prompt_text,
-                    prompt_language=prompt_language,
-                    text=text,
-                    text_language=text_language,
-                    spk="default",
-                    # V5 默认参数：v5turbo steps=4；v5dev steps=32,cfg=1.30（get_tts_wav 内会按版本补全）
-                ):
-                    yield chunk
+                # Keep model selection and the entire streaming inference atomic.
+                # StreamingResponse starts consuming this generator after this
+                # handler returns, so loading the model above would race with
+                # other requests that switch the shared default speaker.
+                with v5proplus_inference_lock:
+                    if nowLoadModelName != model_key:
+                        logger.info(f"====当前加载的模型为: {nowLoadModelName}, 切换为{model_key}模型====")
+                        infer_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        result = load_v5_models(
+                            device=infer_device, is_half=is_half, version=model_key, _lock_held=True
+                        )
+                        if result.status_code != 200:
+                            detail = getattr(result, "body", b"").decode("utf-8", errors="replace")
+                            raise RuntimeError(f"加载{model_key}失败: {detail}")
+                        nowLoadModelName = model_key
+
+                    yield from get_tts_wav(
+                        ref_wav_path=ref_wav_path,
+                        prompt_text=prompt_text,
+                        prompt_language=prompt_language,
+                        text=text,
+                        text_language=text_language,
+                        spk="default",
+                        sample_steps=sample_steps,
+                        cfg_rate=cfg_rate,
+                    )
             finally:
                 if temp_file_path:
                     cleanup_temp_file(temp_file_path)
@@ -2013,7 +2044,7 @@ async def tts_endpoint(
         text_language: str = None,
         model_name: str = None,
 ):
-    return handle(text,model_name,text_language)
+    return handle(text, text_language, model_name)
 
 @app.post("/v2proplus")
 async def v2proplus_tts_endpoint(
@@ -2023,6 +2054,8 @@ async def v2proplus_tts_endpoint(
     prompt_text: str = Form(..., description="参考音频对应的文本"),
     prompt_language: str = Form(..., description="参考音频语言"),
     model_name: str = Form("v5turbo", description="V5型号：v5turbo / v5dev（兼容旧值 v2ProPlus→v5turbo）"),
+    sample_steps: Optional[int] = Form(None, description="V5 Euler 步数；默认 v5turbo=4、v5dev=32"),
+    cfg_rate: Optional[float] = Form(None, description="V5 CFG；默认 v5turbo=0、v5dev=1.30"),
 ):
     """V5 TTS 端点（路径仍为 /v2proplus，兼容旧客户端）
     
@@ -2033,6 +2066,7 @@ async def v2proplus_tts_endpoint(
     - prompt_text: 参考音频对应的文本
     - prompt_language: 参考音频语言（如：zh, en等）
     - model_name: v5turbo（默认）或 v5dev
+    - sample_steps / cfg_rate: 可选 V5 采样参数
     """
     import tempfile
     import uuid
@@ -2063,6 +2097,8 @@ async def v2proplus_tts_endpoint(
             prompt_text=prompt_text,
             prompt_language=prompt_language,
             temp_file_path=temp_file_path,  # 传递临时文件路径以便后续清理
+            sample_steps=sample_steps,
+            cfg_rate=cfg_rate,
         )
     except Exception as e:
         # 如果出错，确保清理临时文件
@@ -2082,6 +2118,8 @@ async def v2proplus_tts_endpoint_get(
         ref_wav_path: str = None,
         prompt_text: str = None,
         prompt_language: str = None,
+        sample_steps: Optional[int] = None,
+        cfg_rate: Optional[float] = None,
 ):
     """V5 TTS 端点 GET（路径仍为 /v2proplus）"""
     return handle_v2proplus(
@@ -2091,6 +2129,8 @@ async def v2proplus_tts_endpoint_get(
         ref_wav_path=ref_wav_path,
         prompt_text=prompt_text,
         prompt_language=prompt_language,
+        sample_steps=sample_steps,
+        cfg_rate=cfg_rate,
     )
 
 
